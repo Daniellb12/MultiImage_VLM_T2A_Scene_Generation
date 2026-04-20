@@ -1,0 +1,36 @@
+# Core Dependencies
+google-genai>=0.3.0
+pycolmap>=0.6.0
+transformers>=4.49.0
+torch>=2.0.0
+qwen-vl-utils[decord]>=0.0.5
+gradio-client>=0.10.0
+
+# Image Processing
+opencv-python>=4.8.0
+pillow>=10.0.0
+
+# Numerical Operations
+numpy>=1.24.0
+scipy>=1.11.0
+
+# 3D Processing & Visualization
+open3d>=0.18.0
+timm>=0.9.0
+
+# Utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+
+# Optional: Depth Estimation Models
+# midas (optional - can be loaded via torch.hub)
+# depth-anything (optional - loaded via transformers)
+
+# Optional: Audio Processing
+soundfile>=0.12.0
+librosa>=0.10.0
+
+# Development
+jupyter>=1.0.0
+matplotlib>=3.7.0

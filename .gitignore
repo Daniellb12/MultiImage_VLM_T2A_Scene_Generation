@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment
+.env
+.env.local
+
+# Data directories (keep structure, ignore contents)
+data/input/*
+!data/input/.gitkeep
+data/generated/*
+!data/generated/.gitkeep
+data/reconstruction/*
+!data/reconstruction/.gitkeep
+data/segmentation/*
+!data/segmentation/.gitkeep
+data/audio/*
+!data/audio/.gitkeep
+data/output/*
+!data/output/.gitkeep
+
+# Model cache
+models/
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files
+*.ply
+*.obj
+*.fbx
+*.wav
+*.mp3
+*.mp4
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# COLMAP database
+*.db
+*.db-shm
+*.db-wal
