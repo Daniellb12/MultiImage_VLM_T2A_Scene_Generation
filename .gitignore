@@ -37,9 +37,29 @@ ENV/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Environment
+# Environment variables and API keys
 .env
-.env.local
+.env.*
+!.env.example
+
+# API keys and credentials (ignore entire directories)
+secrets/
+.secrets/
+credentials/
+api-keys/
+api_keys/
+
+# API key and credential files
+*_key.txt
+*_token.txt
+*_secret.txt
+*credentials*.json
+service-account*.json
+*.pem
+*.p12
+*.pfx
+*.key
+!*.pub.key
 
 # Data directories (keep structure, ignore contents)
 data/input/*
