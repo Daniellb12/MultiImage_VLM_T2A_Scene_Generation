@@ -66,6 +66,8 @@ data/input/*
 !data/input/.gitkeep
 data/generated/*
 !data/generated/.gitkeep
+data/Nano_banana_output_images/*
+!data/Nano_banana_output_images/.gitkeep
 data/reconstruction/*
 !data/reconstruction/.gitkeep
 data/segmentation/*

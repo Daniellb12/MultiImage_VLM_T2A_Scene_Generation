@@ -29,12 +29,13 @@ logger = logging.getLogger(__name__)
 class DepthEstimator:
     """Depth estimation using MiDaS or Depth-Anything models"""
     
-    def __init__(self, model_name: str = "midas_v3_dpt_large", device: str = "cuda"):
+    def __init__(self, model_name: str = "DPT_Large", device: str = "cuda"):
         """
         Initialize depth estimator
         
         Args:
-            model_name: Model to use (midas_v3_dpt_large, dpt_hybrid, etc.)
+            model_name: Model to use. Current MiDaS hub names:
+                        "DPT_Large" (best quality), "DPT_Hybrid", "MiDaS", "MiDaS_small"
             device: Device to run on (cuda, cpu, mps)
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -42,19 +43,24 @@ class DepthEstimator:
         
         logger.info(f"Loading depth estimation model: {model_name} on {self.device}")
         
-        # Load MiDaS model from torch hub
+        # Load MiDaS model from torch hub.
+        # The GitHub org moved from intel-isl → isl-org; force_reload=True
+        # discards any stale cached clone of the old repo.
+        _MIDAS_REPO = "isl-org/MiDaS"
         try:
-            self.model = torch.hub.load("intel-isl/MiDaS", model_name)
+            self.model = torch.hub.load(
+                _MIDAS_REPO, model_name, force_reload=True
+            )
             self.model.to(self.device)
             self.model.eval()
-            
-            # Load transforms
-            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-            if "dpt" in model_name:
+
+            # Load transforms — case-insensitive check for DPT variants
+            midas_transforms = torch.hub.load(_MIDAS_REPO, "transforms")
+            if "dpt" in model_name.lower():
                 self.transform = midas_transforms.dpt_transform
             else:
                 self.transform = midas_transforms.small_transform
-            
+
             logger.info("Depth estimation model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading depth model: {str(e)}")
@@ -168,16 +174,18 @@ class COLMAPReconstructor:
         
         for i, image in enumerate(images):
             if image_paths and i < len(image_paths):
-                filename = Path(image_paths[i]).name
+                stem = Path(image_paths[i]).stem
             else:
-                filename = f"image_{i:03d}.jpg"
-            
+                stem = f"image_{i:03d}"
+            # Always write JPEG — COLMAP is more reliable with JPEG than PNG
+            filename = f"{stem}.jpg"
+
             output_path = os.path.join(self.image_dir, filename)
-            
+
             if image.dtype != np.uint8:
                 image = (image * 255).astype(np.uint8)
-            
-            Image.fromarray(image).save(output_path, quality=95)
+
+            Image.fromarray(image).save(output_path, format="JPEG", quality=95)
             prepared_paths.append(output_path)
         
         logger.info(f"Prepared {len(prepared_paths)} images for COLMAP")
@@ -192,15 +200,12 @@ class COLMAPReconstructor:
         """
         logger.info(f"Extracting {feature_type} features")
         
+        # pycolmap 4.x: FeatureExtractionOptions no longer exposes individual
+        # SIFT params at the top level — pass with defaults (8192 features).
         pycolmap.extract_features(
             database_path=self.database_path,
             image_path=self.image_dir,
-            sift_options=pycolmap.SiftExtractionOptions(
-                max_num_features=8192,
-                first_octave=0,
-                num_octaves=4,
-                octave_resolution=3,
-            )
+            extraction_options=pycolmap.FeatureExtractionOptions(),
         )
         
         logger.info("Feature extraction complete")
@@ -214,18 +219,11 @@ class COLMAPReconstructor:
         """
         logger.info(f"Matching features using {matching_method} method")
 
-        # pycolmap uses VlSiftMatchingOptions (not SiftMatchingOptions) for the
-        # exhaustive matcher; the field names also differ from the old COLMAP CLI.
-        matching_options = pycolmap.SiftMatchingOptions(
-            max_ratio=0.8,
-            max_distance=0.7,
-            cross_check=True,
-        )
-
+        # pycolmap 4.x renamed SiftMatchingOptions → FeatureMatchingOptions.
         if matching_method == "exhaustive":
             pycolmap.match_exhaustive(
                 database_path=self.database_path,
-                matching_options=matching_options,
+                matching_options=pycolmap.FeatureMatchingOptions(),
             )
         else:
             logger.warning(f"Matching method {matching_method} not implemented, using exhaustive")
@@ -246,21 +244,17 @@ class COLMAPReconstructor:
         output_path = os.path.join(self.sparse_dir, "0")
         os.makedirs(output_path, exist_ok=True)
         
-        # Run incremental mapping
+        # pycolmap 4.x moved per-image inlier/error thresholds into nested
+        # sub-objects (mapper, triangulation). Only top-level attributes that
+        # still exist in IncrementalPipelineOptions are used here; defaults
+        # are suitable for a 10-image indoor scene.
         maps = pycolmap.incremental_mapping(
             database_path=self.database_path,
             image_path=self.image_dir,
             output_path=output_path,
             options=pycolmap.IncrementalPipelineOptions(
                 min_num_matches=15,
-                init_min_num_inliers=100,
-                init_max_error=4.0,
-                abs_pose_max_error=12.0,
-                abs_pose_min_num_inliers=30,
-                abs_pose_min_inlier_ratio=0.25,
-                filter_max_reproj_error=4.0,
-                filter_min_tri_angle=1.5,
-            )
+            ),
         )
         
         if not maps:
@@ -410,7 +404,7 @@ def reconstruct_scene(
         config = {
             'use_colmap': True,
             'use_depth_model': True,
-            'depth_model': 'midas_v3_dpt_large',
+            'depth_model': 'DPT_Large',
             'colmap': {
                 'feature_type': 'SIFT',
                 'matching_method': 'exhaustive',
@@ -424,7 +418,7 @@ def reconstruct_scene(
     if config.get('use_depth_model', True):
         try:
             depth_estimator = DepthEstimator(
-                model_name=config.get('depth_model', 'midas_v3_dpt_large'),
+                model_name=config.get('depth_model', 'DPT_Large'),
                 device='cuda' if torch.cuda.is_available() else 'cpu'
             )
             depth_maps = depth_estimator.estimate_depth_batch(

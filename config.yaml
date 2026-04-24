@@ -1,13 +1,15 @@
 image_generation:
-  model: "gemini-2.0-flash-preview-image-generation"
+  model: "gemini-3.1-flash-image-preview"
   num_additional_views: 6
   output_size: [1024, 1024]
   chain_views: true        # each generated view is fed back as a reference for the next
+  output_dir: "data/Nano_banana_output_images"
+  use_cache: true          # reuse previously generated images if they exist
   
 reconstruction:
   use_colmap: true
   use_depth_model: true
-  depth_model: "midas_v3_dpt_large"
+  depth_model: "DPT_Large"
   colmap:
     feature_type: "SIFT"
     matching_method: "exhaustive"
