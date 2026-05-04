@@ -17,7 +17,9 @@ MMAUDIO_REPO = Path(__file__).resolve().parents[1].parent / "MMAudio"
 
 # ── Local inference helpers ────────────────────────────────────────────────────
 
-def _load_local_model(variant: str = "large_44k_v2", device: str = "cuda"):
+def _load_local_model(variant: str = "medium_44k", device: str = "cuda"):
+#def _load_local_model(variant: str = "large_44k_v2", device: str = "cuda"):
+
     """Load MMAudio model weights into memory.  Returns (net, feature_utils, fm, seq_cfg)."""
     import torch
     from mmaudio.eval_utils import all_model_cfg
@@ -61,6 +63,7 @@ def _load_local_model(variant: str = "large_44k_v2", device: str = "cuda"):
                 for p in feature_utils.parameters():
                     p.data = p.data.clone()
 
+        #fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=10)
         fm = FlowMatching(min_sigma=0, inference_mode="euler", num_steps=25)
     finally:
         os.chdir(orig_cwd)
@@ -119,7 +122,7 @@ class AudioGenerator:
 
     def __init__(
         self,
-        variant: str = "large_44k_v2",
+        variant: str = "medium_44k",
         force_api: bool = False,
         space_name: str = "hkchengrex/MMAudio",
         sample_rate: int = 44100,

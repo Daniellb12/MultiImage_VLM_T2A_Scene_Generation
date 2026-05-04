@@ -65,7 +65,7 @@ class SpatialAudioPositioner:
                     'label': obj['label'],
                     'category': obj.get('category', 'unknown'),
                     'audio_file': obj['audio_file'],
-                    'position_3d': obj['position_3d'],
+                    'position_3d': obj.get('position_3d', [0.0, 0.0, float(obj.get('depth', 5.0))]),
                     'intensity': self._compute_intensity(obj),
                     'confidence': obj.get('confidence', 0.0),
                     'depth': obj.get('depth', 0.0)

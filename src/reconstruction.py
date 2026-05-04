@@ -76,13 +76,13 @@ class DepthEstimator:
         Returns:
             Depth map as numpy array (H, W)
         """
-        # Convert to PIL Image for transform
+        # MiDaS transforms expect a numpy RGB array, not a PIL Image
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
-        pil_image = Image.fromarray(image)
-        
+        img_np = np.array(image)  # ensure it's a plain numpy array
+
         # Apply transforms
-        input_batch = self.transform(pil_image).to(self.device)
+        input_batch = self.transform(img_np).to(self.device)
         
         # Predict depth
         with torch.no_grad():
@@ -365,9 +365,12 @@ class COLMAPReconstructor:
             ])
 
             # COLMAP extrinsic: X_cam = R @ X_world + t
-            # World position of camera centre = -R^T @ t
-            R = image.rotmat()
-            t = image.tvec
+            # pycolmap 4.x: image.cam_from_world is a Rigid3d object.
+            # rotation.matrix() gives the 3×3 rotation matrix.
+            # translation gives the tvec.
+            cam_from_world = image.cam_from_world
+            R = cam_from_world.rotation.matrix()
+            t = cam_from_world.translation
             extrinsic = np.eye(4)
             extrinsic[:3, :3] = R
             extrinsic[:3,  3] = t  # camera-space transform (for unprojection)

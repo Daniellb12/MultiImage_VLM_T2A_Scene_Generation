@@ -38,6 +38,9 @@ dependencies:
     # Google Gemini (Nano Banana — Stage 1)
     - google-genai>=0.3.0
 
+    # OpenAI GPT Image 2 (optional alternative image generation backend)
+    - openai>=1.0.0
+
     # Environment variable loading
     - python-dotenv>=1.0.0
 

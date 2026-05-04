@@ -1,5 +1,6 @@
 # Core Dependencies
 google-genai>=0.3.0
+openai>=1.0.0
 pycolmap>=0.6.0
 transformers>=4.49.0
 torch>=2.0.0
