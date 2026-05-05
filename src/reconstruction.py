@@ -391,89 +391,158 @@ def reconstruct_scene(
     config: Dict = None,
     output_dir: str = "data/reconstruction"
 ) -> Dict:
-    """
-    Complete 3D reconstruction pipeline
-    
+    """Complete 3D reconstruction pipeline.
+
+    The ``method`` key in config selects the reconstruction backend:
+
+    * ``"dust3r"``     — DUSt3R transformer (default; works on AI-generated images,
+                         no feature matching required).
+    * ``"colmap"``     — Classic COLMAP SfM (requires real photos with photometric
+                         consistency for SIFT to succeed).
+    * ``"depth_only"`` — Skip camera pose estimation entirely; use synthetic
+                         pinhole intrinsics from image dimensions.
+
+    If DUSt3R or COLMAP fails, the pipeline falls back to depth-only mode so
+    that spatial audio positioning still works.
+
     Args:
-        images: List of input images
-        image_paths: Optional list of original image paths
-        config: Configuration dictionary
-        output_dir: Output directory
-    
+        images:      List of input images (H×W×3 uint8 numpy arrays).
+        image_paths: Optional list of original image paths (used for filenames).
+        config:      Configuration dictionary (reconstruction section).
+        output_dir:  Root output directory.
+
     Returns:
-        Dictionary with reconstruction results
+        Dictionary with reconstruction results.
     """
     if config is None:
         config = {
-            'use_colmap': True,
+            'method': 'dust3r',
             'use_depth_model': True,
             'depth_model': 'DPT_Large',
             'colmap': {
                 'feature_type': 'SIFT',
                 'matching_method': 'exhaustive',
-                'dense_reconstruction': True
-            }
+                'dense_reconstruction': False,
+            },
         }
-    
+
+    method = config.get('method', 'dust3r').lower()
     results = {}
-    
-    # Depth estimation
+
+    # ------------------------------------------------------------------
+    # Step 1 — Depth estimation (always run; used for spatial audio even
+    # when DUSt3R handles camera poses)
+    # ------------------------------------------------------------------
     if config.get('use_depth_model', True):
         try:
             depth_estimator = DepthEstimator(
                 model_name=config.get('depth_model', 'DPT_Large'),
-                device='cuda' if torch.cuda.is_available() else 'cpu'
+                device='cuda' if torch.cuda.is_available() else 'cpu',
             )
             depth_maps = depth_estimator.estimate_depth_batch(
                 images,
-                output_dir=os.path.join(output_dir, "depth")
+                output_dir=os.path.join(output_dir, "depth"),
             )
             results['depth_maps'] = depth_maps
             logger.info("Depth estimation completed successfully")
         except Exception as e:
             logger.error(f"Depth estimation failed: {str(e)}")
             results['depth_maps'] = None
-    
-    # COLMAP reconstruction
-    if config.get('use_colmap', True):
+
+    # ------------------------------------------------------------------
+    # Step 2 — Camera pose estimation
+    # ------------------------------------------------------------------
+
+    if method == 'dust3r':
+        # ── DUSt3R ─────────────────────────────────────────────────────
+        try:
+            from src.reconstruction_dust3r import reconstruct_with_dust3r
+            logger.info("Running DUSt3R reconstruction")
+            dust3r_results = reconstruct_with_dust3r(
+                images,
+                config=config,
+                output_dir=output_dir,
+            )
+            results.update(dust3r_results)
+            # Re-attach depth maps from Step 1 (DUSt3R doesn't produce them)
+            if results.get('depth_maps') is None and 'depth_maps' in results:
+                pass  # already None
+            logger.info("DUSt3R reconstruction completed successfully")
+        except Exception as e:
+            logger.error(f"DUSt3R reconstruction failed: {e}")
+            results['camera_data'] = None
+
+    elif method == 'colmap':
+        # ── COLMAP ─────────────────────────────────────────────────────
         try:
             colmap = COLMAPReconstructor(output_dir=os.path.join(output_dir, "colmap"))
-            
-            # Prepare images
             colmap.prepare_images(images, image_paths)
-            
-            # Feature extraction and matching
             colmap.run_feature_extraction(
-                feature_type=config['colmap'].get('feature_type', 'SIFT')
+                feature_type=config.get('colmap', {}).get('feature_type', 'SIFT')
             )
             colmap.run_feature_matching(
-                matching_method=config['colmap'].get('matching_method', 'exhaustive')
+                matching_method=config.get('colmap', {}).get('matching_method', 'exhaustive')
             )
-            
-            # Sparse reconstruction
             sparse_reconstruction = colmap.run_sparse_reconstruction()
             results['sparse_reconstruction'] = sparse_reconstruction
-            
-            # Get camera data
             camera_data = colmap.get_camera_data()
             results['camera_data'] = camera_data
-            
-            # Dense reconstruction (optional, can be slow)
-            if config['colmap'].get('dense_reconstruction', False):
+
+            if config.get('colmap', {}).get('dense_reconstruction', False):
                 try:
                     dense_ply = colmap.run_dense_reconstruction()
                     results['dense_point_cloud'] = dense_ply
                 except Exception as e:
                     logger.warning(f"Dense reconstruction failed: {str(e)}")
                     results['dense_point_cloud'] = None
-            
+
             logger.info("COLMAP reconstruction completed successfully")
-            
         except Exception as e:
             logger.error(f"COLMAP reconstruction failed: {str(e)}")
             results['sparse_reconstruction'] = None
             results['camera_data'] = None
-    
+
+    else:
+        # ── depth_only — skip pose estimation entirely ──────────────────
+        logger.info("Reconstruction method=depth_only: skipping camera pose estimation")
+        results['camera_data'] = None
+
+    # Depth-only camera_data fallback
+    # If COLMAP failed (camera_data is None) but we have depth maps, synthesise
+    # a camera_data dict using pinhole intrinsics derived from image dimensions
+    # and identity extrinsics.  This lets project_objects_to_3d produce
+    # meaningful relative 3-D positions without any COLMAP output.
+    if not results.get('camera_data') and results.get('depth_maps'):
+        logger.info(
+            "COLMAP unavailable — building synthetic camera_data from image "
+            "shapes for depth-only 3-D projection"
+        )
+        synthetic = {
+            'intrinsics': {},
+            'extrinsics': {},
+            'image_names': {},
+            'camera_centers': {},
+            'depth_only': True,
+        }
+        for idx, img in enumerate(images):
+            h, w = img.shape[:2]
+            fx = fy = 0.7 * w
+            cx, cy = w / 2.0, h / 2.0
+            K = np.array([
+                [fx,  0, cx],
+                [ 0, fy, cy],
+                [ 0,  0,  1],
+            ], dtype=np.float64)
+            synthetic['intrinsics'][idx]  = K
+            synthetic['extrinsics'][idx]  = np.eye(4)
+            synthetic['image_names'][idx] = f"image_{idx:03d}"
+            synthetic['camera_centers'][idx] = np.zeros(3)
+        results['camera_data'] = synthetic
+        logger.info(
+            f"Synthetic camera_data created for {len(images)} images "
+            "(fx=fy=0.7*W, identity extrinsics)"
+        )
+
     return results
 
 

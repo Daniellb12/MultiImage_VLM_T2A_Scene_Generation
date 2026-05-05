@@ -83,7 +83,96 @@ Produce a structured spatial report with these exact sections:
 Be concrete and specific. This description will be used to regenerate the same
 room from new camera angles, so consistency of every detail matters."""
 
-_VIEW_SPECIFICATIONS: List[str] = [
+# Cardinal direction names for arc positions (every 45°, clockwise from North).
+_ARC_COMPASS = [
+    "North", "North-East", "East", "South-East",
+    "South", "South-West", "West", "North-West",
+]
+
+
+def _min_views_for_overlap(hfov_deg: float = 65.0, target_overlap: float = 0.60) -> int:
+    """Return the minimum number of arc positions for the requested frame overlap.
+
+    For a ~65° HFOV and 60% overlap this evaluates to 12 views (30° spacing).
+
+    Args:
+        hfov_deg:       Horizontal field of view in degrees.
+        target_overlap: Desired fractional overlap between adjacent frames (0–1).
+
+    Returns:
+        Minimum integer number of views for a full 360° arc.
+    """
+    import math
+    half_hfov = math.radians(hfov_deg / 2.0)
+    sin_half_step = math.tan(half_hfov) * (1.0 - target_overlap)
+    sin_half_step = min(sin_half_step, 1.0)
+    half_step = math.asin(sin_half_step)
+    step_deg = math.degrees(2.0 * half_step)
+    return math.ceil(360.0 / step_deg)
+
+
+def _make_arc_view_specs(
+    n: int,
+    radius_fraction: float = 0.4,
+) -> List[str]:
+    """Generate n camera positions on a horizontal arc around the room centre.
+
+    Adjacent views are spaced 360°/n apart and all point toward the room centre
+    at standing eye height (1.6 m).
+
+    For COLMAP and 3DGS to succeed, adjacent views must overlap ≥ 60%.
+    With a ~65° HFOV lens this requires ≥ 12 views (30° spacing).
+    Use ``_min_views_for_overlap()`` to compute the exact minimum.
+
+    Args:
+        n:                Number of views (≥ 1, no upper cap).
+        radius_fraction:  Camera arc radius as fraction of shorter room dim.
+
+    Returns:
+        List of n camera position strings suitable for _build_view_prompt.
+    """
+    import math
+    n = max(1, n)
+    step = 360.0 / n
+    specs = []
+    for i in range(n):
+        angle_deg = i * step
+        angle_rad = math.radians(angle_deg)
+
+        label_idx        = round(angle_deg / 45) % 8
+        compass          = _ARC_COMPASS[label_idx]
+        opposite_idx     = (label_idx + 4) % 8
+        opposite_compass = _ARC_COMPASS[opposite_idx]
+
+        x_frac = math.sin(angle_rad) * radius_fraction
+        z_frac = -math.cos(angle_rad) * radius_fraction
+
+        prev_angle = (angle_deg - step) % 360
+        next_angle = (angle_deg + step) % 360
+
+        spec = (
+            f"Camera on a circular arc around the room centre, positioned at "
+            f"{angle_deg:.1f}° clockwise from North (approximately {compass} side). "
+            f"Approximate offset from centre: {x_frac:+.2f}× room-width East, "
+            f"{z_frac:+.2f}× room-depth North (arc radius ≈ {radius_fraction*100:.0f}% "
+            f"of the shorter room dimension). "
+            f"Camera height: standing eye level (~1.6 m). "
+            f"Pointing directly toward the room centre — the {opposite_compass} wall "
+            f"fills the far background of the frame. "
+            f"Focal length: ~35 mm equivalent (~65° HFOV). "
+            f"IMPORTANT: This view must overlap approximately {step:.0f}°-worth of scene "
+            f"content with its neighbours at {prev_angle:.1f}° and {next_angle:.1f}°. "
+            f"Do NOT rotate or reframe away from the room centre — the angular spacing "
+            f"between consecutive views is designed to give COLMAP and 3DGS at least "
+            f"60% frame overlap for successful feature matching."
+        )
+        specs.append(spec)
+    return specs
+
+
+# Legacy fixed specifications kept for backward-compatibility when
+# view_strategy = "fixed" is set in config.yaml.
+_FIXED_VIEW_SPECIFICATIONS: List[str] = [
     (
         "Camera at the geometric center of the room at standing eye height (~1.6 m), "
         "facing the North wall directly (perpendicular to it). Standard ~35 mm equivalent "
@@ -206,18 +295,23 @@ class OpenAIImageGenerator:
         size: str = "1024x1024",
         text_model: str = "gemini",
         gemini_api_key: Optional[str] = None,
+        view_strategy: str = "arc",
+        arc_radius_fraction: float = 0.4,
     ):
         """
         Args:
-            api_key:        OpenAI API key. Reads OPENAI_API_KEY env var if None.
-            model:          GPT Image model name (default: gpt-image-2). Passed
-                            to the image_generation tool config.
-            quality:        Output quality — "low", "medium", "high", or "auto".
-            size:           Output dimensions, e.g. "1024x1024", "1536x1024".
-            text_model:     "gemini" to use Gemini 2.5 Flash for scene analysis
-                            (requires GEMINI_API_KEY), or "gpt-4o" to use OpenAI.
-            gemini_api_key: Gemini API key for scene analysis when text_model="gemini".
-                            Reads GEMINI_API_KEY env var if None.
+            api_key:              OpenAI API key. Reads OPENAI_API_KEY env var if None.
+            model:                GPT Image model name (default: gpt-image-2).
+            quality:              Output quality — "low", "medium", "high", or "auto".
+            size:                 Output dimensions, e.g. "1024x1024", "1536x1024".
+            text_model:           "gemini" to use Gemini 2.5 Flash for scene analysis
+                                  (requires GEMINI_API_KEY), or "gpt-4o" to use OpenAI.
+            gemini_api_key:       Gemini API key when text_model="gemini".
+                                  Reads GEMINI_API_KEY env var if None.
+            view_strategy:        "arc" (COLMAP-compatible circular arc, default) or
+                                  "fixed" (legacy cardinal/corner positions).
+            arc_radius_fraction:  For the "arc" strategy, camera arc radius as a
+                                  fraction of the shorter room dimension (default 0.4).
         """
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -225,10 +319,12 @@ class OpenAIImageGenerator:
                 "OPENAI_API_KEY not found. Set it in .env or pass as argument."
             )
 
-        self.model = model
-        self.quality = quality
-        self.size = size
-        self.text_model = text_model
+        self.model               = model
+        self.quality             = quality
+        self.size                = size
+        self.text_model          = text_model
+        self.view_strategy       = view_strategy
+        self.arc_radius_fraction = arc_radius_fraction
         self.client = OpenAI(api_key=self.api_key)
 
         # Scene analysis client — Gemini by default
@@ -424,8 +520,15 @@ class OpenAIImageGenerator:
                 "Spatial anchoring will be weaker."
             )
 
-        num_views = min(num_views, len(_VIEW_SPECIFICATIONS))
-        specs = _VIEW_SPECIFICATIONS[:num_views]
+        # Choose view strategy from config (arc = COLMAP-compatible, fixed = legacy)
+        _view_strategy   = getattr(self, 'view_strategy', 'arc')
+        _radius_fraction = getattr(self, 'arc_radius_fraction', 0.4)
+        if _view_strategy == 'fixed':
+            _all_specs = _FIXED_VIEW_SPECIFICATIONS
+            num_views  = min(num_views, len(_all_specs))
+            specs      = _all_specs[:num_views]
+        else:
+            specs = _make_arc_view_specs(num_views, radius_fraction=_radius_fraction)
 
         os.makedirs(output_dir, exist_ok=True)
         out_path = Path(output_dir)

@@ -403,70 +403,110 @@ Keep the description concise but informative."""
         return output_text
 
 
+def _make_pinhole_intrinsic(w: int, h: int) -> np.ndarray:
+    """
+    Synthesise a pinhole intrinsic matrix from image dimensions.
+
+    Assumes a 35 mm-equivalent focal length (~65° HFOV), which is a reasonable
+    default for interior photographs captured without COLMAP.  The focal length
+    in pixels is fx = fy = 0.7 * W (derived from tan(HFOV/2) = W/2 / fx).
+    """
+    fx = fy = 0.7 * w
+    cx, cy = w / 2.0, h / 2.0
+    return np.array([
+        [fx,  0, cx],
+        [ 0, fy, cy],
+        [ 0,  0,  1],
+    ], dtype=np.float64)
+
+
 def project_objects_to_3d(
     segmentation_results: List[Dict[str, Any]],
-    camera_data: Dict[str, np.ndarray],
+    camera_data: Optional[Dict[str, np.ndarray]],
     depth_maps: Optional[List[np.ndarray]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Project 2D detected objects to 3D space
-    
+    Project 2D detected objects to 3D space.
+
+    When ``camera_data`` is ``None`` (e.g. COLMAP failed) but ``depth_maps``
+    are available, the function falls back to depth-only positioning:
+
+    - Pinhole intrinsics are synthesised from the image dimensions
+      (35 mm equivalent, ~65° HFOV: fx = fy = 0.7 * W).
+    - Camera extrinsics are set to the identity matrix (camera-space = world-
+      space), which is internally consistent for monocular depth even though
+      the absolute metric scale is unknown.
+    - MiDaS depth is relative, not metric, but the *ratios* between object
+      distances are preserved, which is sufficient for spatial audio panning.
+
     Args:
-        segmentation_results: List of segmentation results from segment_batch
-        camera_data: Camera intrinsics and extrinsics from COLMAP
-        depth_maps: Optional depth maps for each image
-    
+        segmentation_results: List of segmentation results from segment_batch.
+        camera_data: Camera intrinsics and extrinsics from COLMAP, or ``None``
+            to use the depth-only fallback.
+        depth_maps: Optional depth maps for each image (required for the
+            depth-only fallback to produce meaningful positions).
+
     Returns:
-        List of objects with 3D positions
+        List of objects with 3D positions.
     """
     from src.utils import unproject_2d_to_3d, compute_bounding_box_center
-    
+
+    depth_only_mode = camera_data is None
+    if depth_only_mode:
+        logger.info(
+            "project_objects_to_3d: no COLMAP camera_data — using depth-only "
+            "pinhole fallback (fx=fy=0.7*W, identity extrinsics)"
+        )
+
     objects_3d = []
-    
+
     for result in segmentation_results:
         image_idx = result.get('image_index', 0)
-        
-        # Get camera parameters for this image
-        if image_idx not in camera_data.get('intrinsics', {}):
-            logger.warning(f"No camera data for image {image_idx}")
-            continue
-        
-        intrinsic = camera_data['intrinsics'][image_idx]
-        extrinsic = camera_data['extrinsics'][image_idx]
-        
+        h, w = result.get('image_shape', [480, 640])[:2]
+
+        # --- Determine intrinsic / extrinsic for this image ---
+        if depth_only_mode:
+            intrinsic = _make_pinhole_intrinsic(w, h)
+            extrinsic = np.eye(4)          # identity: camera-space == world-space
+        else:
+            if image_idx not in camera_data.get('intrinsics', {}):
+                logger.warning(f"No camera data for image {image_idx}, skipping")
+                continue
+            intrinsic = camera_data['intrinsics'][image_idx]
+            extrinsic = camera_data['extrinsics'][image_idx]
+
         # Get depth map if available
         depth_map = depth_maps[image_idx] if depth_maps and image_idx < len(depth_maps) else None
-        
+
         for obj in result.get('objects', []):
             if 'bbox' not in obj:
                 continue
-            
+
             bbox = obj['bbox']
-            h, w = result['image_shape'][:2]
-            
-            # Compute center of bounding box
+
+            # Compute centre of bounding box (normalised → pixel)
             center_2d = compute_bounding_box_center(bbox)
             center_2d_pixel = np.array([center_2d[0] * w, center_2d[1] * h])
-            
-            # Get depth value at center
+
+            # Get depth value at centre pixel
             if depth_map is not None:
                 depth_y = int(np.clip(center_2d_pixel[1], 0, h - 1))
                 depth_x = int(np.clip(center_2d_pixel[0], 0, w - 1))
-                depth = depth_map[depth_y, depth_x]
+                depth = float(depth_map[depth_y, depth_x])
             else:
-                # Use default depth if no depth map
-                depth = 5.0  # meters
-                logger.warning(f"No depth map available, using default depth: {depth}")
-            
+                depth = 5.0
+                logger.warning(
+                    f"No depth map for image {image_idx}, using default depth 5.0"
+                )
+
             # Unproject to 3D
             position_3d = unproject_2d_to_3d(
                 center_2d_pixel,
                 depth,
                 intrinsic,
-                extrinsic
+                extrinsic,
             )
-            
-            # Create 3D object entry
+
             obj_3d = {
                 'id': f"obj_{image_idx:03d}_{len(objects_3d):03d}",
                 'label': obj.get('label', 'unknown'),
@@ -476,11 +516,12 @@ def project_objects_to_3d(
                 'position_2d': center_2d_pixel.tolist(),
                 'bbox': bbox,
                 'image_index': image_idx,
-                'depth': float(depth)
+                'depth': depth,
+                'depth_only': depth_only_mode,
             }
-            
+
             objects_3d.append(obj_3d)
-    
+
     logger.info(f"Projected {len(objects_3d)} objects to 3D space")
     return objects_3d
 

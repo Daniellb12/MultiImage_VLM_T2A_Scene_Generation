@@ -10,21 +10,43 @@ image_generation:
   openai_size: "1024x1024"            # e.g. 1024x1024, 1536x1024, 1024x1536
   openai_text_model: "gemini"         # "gemini" (uses GEMINI_API_KEY) or "gpt-4o"
 
+  # ── View strategy ───────────────────────────────────────────────────────────
+  # "arc"   — Cameras on a horizontal circle around the room centre. Required for
+  #            COLMAP feature matching and 3DGS to succeed.
+  # "fixed" — Legacy cardinal/corner positions (wider coverage, no overlap guarantee).
+  view_strategy: "arc"
+  arc_radius_fraction: 0.4  # arc radius as fraction of shorter room dimension (~1.5m in a 4m wide room)
+
   # ── Shared settings ─────────────────────────────────────────────────────────
-  num_additional_views: 6
+  # num_additional_views: minimum for >=60% overlap with 65° HFOV = 12 (30° spacing).
+  # Formula: ceil(360 / (2*degrees(arcsin(tan(HFOV/2)*(1-overlap)))))
+  # Increase for wider FOV or higher overlap requirement.
+  num_additional_views: 20
   output_size: [1024, 1024]
   chain_views: true        # each generated view is fed back as a reference for the next
   output_dir: "data/Nano_banana_output_images"
   use_cache: true          # reuse previously generated images if they exist
   
 reconstruction:
-  use_colmap: true
-  use_depth_model: true
+  # Reconstruction backend:
+  #   "dust3r"     — DUSt3R transformer (recommended; works on AI-generated images,
+  #                  no SIFT feature matching required, ~2 GB model auto-downloaded)
+  #   "colmap"     — Classic COLMAP SfM (requires real photos with photometric
+  #                  consistency; fails on AI-generated images)
+  #   "depth_only" — Skip pose estimation; use MiDaS depth + synthetic intrinsics
+  method: "dust3r"
+  use_depth_model: true     # always run MiDaS for per-pixel depth (used by spatial audio)
   depth_model: "DPT_Large"
+  # ── DUSt3R settings ────────────────────────────────────────────────────────
+  dust3r_model: "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"  # HF model id or local path
+  dust3r_img_size: 224      # 224 or 512 (must match model checkpoint)
+  dust3r_niter: 150         # global alignment iterations (more = better, slower)
+  dust3r_min_conf: 1.5      # confidence threshold for point cloud filtering
+  # ── COLMAP settings (only used when method: "colmap") ──────────────────────
   colmap:
     feature_type: "SIFT"
     matching_method: "exhaustive"
-    dense_reconstruction: true
+    dense_reconstruction: false
   
 segmentation:
   model: "Qwen/Qwen2.5-VL-7B-Instruct"
