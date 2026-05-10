@@ -395,15 +395,18 @@ def reconstruct_scene(
 
     The ``method`` key in config selects the reconstruction backend:
 
-    * ``"dust3r"``     — DUSt3R transformer (default; works on AI-generated images,
-                         no feature matching required).
+    * ``"vggt"``       — VGGT transformer (CVPR 2025 Best Paper; default).
+                         Single forward pass over all images; outputs camera
+                         poses AND per-image depth maps without any iterative
+                         optimisation.  Works well on AI-generated images.
+    * ``"dust3r"``     — DUSt3R transformer (legacy; pairwise + global alignment).
     * ``"colmap"``     — Classic COLMAP SfM (requires real photos with photometric
                          consistency for SIFT to succeed).
     * ``"depth_only"`` — Skip camera pose estimation entirely; use synthetic
                          pinhole intrinsics from image dimensions.
 
-    If DUSt3R or COLMAP fails, the pipeline falls back to depth-only mode so
-    that spatial audio positioning still works.
+    If the selected backend fails, the pipeline falls back to depth-only mode
+    so that spatial audio positioning still works.
 
     Args:
         images:      List of input images (H×W×3 uint8 numpy arrays).
@@ -416,8 +419,8 @@ def reconstruct_scene(
     """
     if config is None:
         config = {
-            'method': 'dust3r',
-            'use_depth_model': True,
+            'method': 'vggt',
+            'use_depth_model': False,  # VGGT provides depth maps natively
             'depth_model': 'DPT_Large',
             'colmap': {
                 'feature_type': 'SIFT',
@@ -426,14 +429,19 @@ def reconstruct_scene(
             },
         }
 
-    method = config.get('method', 'dust3r').lower()
+    method = config.get('method', 'vggt').lower()
     results = {}
 
     # ------------------------------------------------------------------
-    # Step 1 — Depth estimation (always run; used for spatial audio even
-    # when DUSt3R handles camera poses)
+    # Step 1 — Depth estimation via MiDaS (optional).
+    # VGGT produces its own depth maps, so skip MiDaS when method='vggt'
+    # unless the user explicitly forces use_depth_model=True.
     # ------------------------------------------------------------------
-    if config.get('use_depth_model', True):
+    run_midas = config.get('use_depth_model', True)
+    if method == 'vggt':
+        run_midas = config.get('use_depth_model', False)
+
+    if run_midas:
         try:
             depth_estimator = DepthEstimator(
                 model_name=config.get('depth_model', 'DPT_Large'),
@@ -453,7 +461,28 @@ def reconstruct_scene(
     # Step 2 — Camera pose estimation
     # ------------------------------------------------------------------
 
-    if method == 'dust3r':
+    if method == 'vggt':
+        # ── VGGT (CVPR 2025 Best Paper) ────────────────────────────────
+        # Single feed-forward pass over all images; returns camera poses
+        # AND per-image depth maps natively.
+        try:
+            from src.reconstruction_vggt import reconstruct_with_vggt
+            logger.info("Running VGGT reconstruction")
+            vggt_results = reconstruct_with_vggt(
+                images,
+                config=config,
+                output_dir=output_dir,
+            )
+            results.update(vggt_results)
+            # Prefer VGGT depth maps; keep MiDaS ones only as a fallback
+            if results.get('depth_maps') is None and 'depth_maps' in results:
+                pass  # remain None
+            logger.info("VGGT reconstruction completed successfully")
+        except Exception as e:
+            logger.error(f"VGGT reconstruction failed: {e}")
+            results['camera_data'] = None
+
+    elif method == 'dust3r':
         # ── DUSt3R ─────────────────────────────────────────────────────
         try:
             from src.reconstruction_dust3r import reconstruct_with_dust3r
@@ -464,7 +493,7 @@ def reconstruct_scene(
                 output_dir=output_dir,
             )
             results.update(dust3r_results)
-            # Re-attach depth maps from Step 1 (DUSt3R doesn't produce them)
+            # Re-attach MiDaS depth maps (DUSt3R doesn't produce them)
             if results.get('depth_maps') is None and 'depth_maps' in results:
                 pass  # already None
             logger.info("DUSt3R reconstruction completed successfully")

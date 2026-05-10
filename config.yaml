@@ -21,24 +21,44 @@ image_generation:
   # num_additional_views: minimum for >=60% overlap with 65° HFOV = 12 (30° spacing).
   # Formula: ceil(360 / (2*degrees(arcsin(tan(HFOV/2)*(1-overlap)))))
   # Increase for wider FOV or higher overlap requirement.
-  num_additional_views: 20
-  output_size: [1024, 1024]
+  num_additional_views: 12
+  # output_size: null means "use the model's native output resolution".
+  # The generator captures the native size from the first generated frame and
+  # downscales all input images to match — so every file going into 3D
+  # reconstruction is pixel-for-pixel identical in size.
+  # Set to e.g. [1024, 1024] only if you want to cap a model that generates
+  # larger than that; upscaling is never applied.
+  output_size: [1440, 1080]
   chain_views: true        # each generated view is fed back as a reference for the next
   output_dir: "data/Nano_banana_output_images"
   use_cache: true          # reuse previously generated images if they exist
   
 reconstruction:
   # Reconstruction backend:
-  #   "dust3r"     — DUSt3R transformer (recommended; works on AI-generated images,
-  #                  no SIFT feature matching required, ~2 GB model auto-downloaded)
-  #   "colmap"     — Classic COLMAP SfM (requires real photos with photometric
-  #                  consistency; fails on AI-generated images)
-  #   "depth_only" — Skip pose estimation; use MiDaS depth + synthetic intrinsics
-  method: "dust3r"
-  use_depth_model: true     # always run MiDaS for per-pixel depth (used by spatial audio)
-  depth_model: "DPT_Large"
-  # ── DUSt3R settings ────────────────────────────────────────────────────────
-  dust3r_model: "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"  # HF model id or local path
+  #   "vggt"       — VGGT transformer (CVPR 2025 Best Paper; default).
+  #                  Single forward pass over ALL images at once; outputs camera
+  #                  poses AND per-image depth maps natively. No iterative
+  #                  optimisation needed. ~4 GB VRAM for 16 frames on bfloat16.
+  #   "dust3r"     — DUSt3R transformer (legacy; pairwise + global alignment).
+  #   "colmap"     — Classic COLMAP SfM (requires real photos; fails on AI images).
+  #   "depth_only" — Skip pose estimation; use MiDaS depth + synthetic intrinsics.
+  method: "vggt"
+  use_depth_model: false    # VGGT provides per-image depth maps; MiDaS not needed
+  depth_model: "DPT_Large"  # only used when use_depth_model: true or method != vggt
+  # ── VGGT settings ──────────────────────────────────────────────────────────
+  vggt_model: "facebook/VGGT-1B"   # HF model id; auto-downloaded on first run
+                                    # use "facebook/VGGT-1B-Commercial" for commercial projects
+  vggt_conf_threshold: 1.0          # depth-confidence filter for point cloud export.
+                                    # Check [VGGT] confidence stats in the notebook output
+                                    # and set just below the reported mean. 5.0 is too high
+                                    # for AI-generated images; 1.0 is a good starting point.
+  vggt_use_ba: false                # set true to run optional pycolmap bundle adjustment
+                                    # (slower but improves pose accuracy)
+  vggt_max_images: 24               # hard cap on frames sent to the forward pass.
+                                    # 24 is safe for 12 GB VRAM (3080 Ti) with bfloat16.
+                                    # Lower to 16 for 8 GB cards.
+  # ── DUSt3R settings (only used when method: "dust3r") ──────────────────────
+  dust3r_model: "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
   dust3r_img_size: 224      # 224 or 512 (must match model checkpoint)
   dust3r_niter: 150         # global alignment iterations (more = better, slower)
   dust3r_min_conf: 1.5      # confidence threshold for point cloud filtering

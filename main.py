@@ -214,13 +214,17 @@ class Pipeline:
             self.state['scene_description'] = scene_description
             self.logger.info(f"Scene: {scene_description[:200]}...")
             
+            # output_size=None → use model native size (inputs are downscaled to match)
+            _raw_size = self.config['image_generation'].get('output_size')
+            _output_size = tuple(_raw_size) if _raw_size else None
+
             # Generate additional views with sequential conditioning
             generated_images = generator.generate_additional_views(
                 input_images=self.state['input_images'],
                 scene_description=scene_description,
                 num_views=self.config['image_generation']['num_additional_views'],
                 output_dir=self.directories['generated'],
-                output_size=tuple(self.config['image_generation']['output_size']),
+                output_size=_output_size,
                 chain_views=self.config['image_generation'].get('chain_views', True),
             )
             

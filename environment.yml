@@ -49,11 +49,15 @@ dependencies:
     - accelerate>=0.27.0
     - qwen-vl-utils[decord]>=0.0.5
 
-    # 3-D reconstruction
+    # 3-D reconstruction — VGGT (CVPR 2025 Best Paper)
+    - git+https://github.com/facebookresearch/vggt.git
+
+    # 3-D reconstruction — supporting libs (also used by VGGT / DUSt3R fallback)
     - pycolmap>=0.6.0
     - open3d>=0.18.0
+    - trimesh>=4.0.0      # point-cloud I/O used by VGGT demo utilities
 
-    # Depth estimation backbone
+    # Depth estimation backbone (MiDaS — used as fallback when method != vggt)
     - timm>=0.9.0
 
     # Computer vision

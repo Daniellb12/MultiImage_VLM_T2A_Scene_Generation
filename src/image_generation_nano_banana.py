@@ -429,11 +429,11 @@ class NanoBananaImageGenerator:
         reference_images: List[np.ndarray],
         view_spec: str,
         scene_description: str,
-        output_size: Tuple[int, int] = (1024, 1024),
+        output_size: Optional[Tuple[int, int]] = None,
         prior_specs: Optional[List[str]] = None,
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, Tuple[int, int]]:
         """
-        Generate one new view.
+        Generate one new view at the model's native output resolution.
 
         Args:
             reference_images: Visual anchors (original 4 + any prior generated
@@ -441,12 +441,18 @@ class NanoBananaImageGenerator:
             view_spec:         Camera-explicit position description anchored to
                                room geometry.
             scene_description: Full Stage-1 structured report to inject into prompt.
-            output_size:       (width, height) to resize the generated image to.
+            output_size:       If given, resize the generated image to this
+                               (width, height) after decoding.  Should only be
+                               used to *downscale* — upscaling or aspect-ratio
+                               changes degrade quality.  ``None`` (default) keeps
+                               the model's native output size.
             prior_specs:       Camera descriptions already generated, injected
                                into the prompt to prevent duplicate angles.
 
         Returns:
-            Generated image as uint8 numpy array (H, W, 3).
+            Tuple of:
+              - Generated image as uint8 numpy array (H, W, 3).
+              - Native (width, height) reported by the model before any resize.
         """
         logger.info(f"Generating view: {view_spec[:80]}...")
 
@@ -469,10 +475,19 @@ class NanoBananaImageGenerator:
                 for part in response.candidates[0].content.parts:
                     if hasattr(part, "inline_data") and part.inline_data:
                         image = Image.open(BytesIO(part.inline_data.data)).convert("RGB")
-                        image = image.resize(output_size, Image.Resampling.LANCZOS)
+                        native_size: Tuple[int, int] = image.size  # (width, height)
+                        logger.info(
+                            f"Gemini native output size: {native_size[0]}x{native_size[1]}"
+                        )
+                        if output_size is not None and output_size != native_size:
+                            logger.info(
+                                f"Resizing generated image {native_size[0]}x{native_size[1]} "
+                                f"→ {output_size[0]}x{output_size[1]}"
+                            )
+                            image = image.resize(output_size, Image.Resampling.LANCZOS)
                         arr = np.array(image)
                         logger.info(f"Generated image shape: {arr.shape}")
-                        return arr
+                        return arr, native_size
 
             raise ValueError("No image found in API response")
 
@@ -490,7 +505,7 @@ class NanoBananaImageGenerator:
         scene_description: str,
         num_views: int = 6,
         output_dir: str = "data/Nano_banana_output_images",
-        output_size: Tuple[int, int] = (1024, 1024),
+        output_size: Optional[Tuple[int, int]] = None,
         chain_views: bool = True,
         use_cache: bool = True,
         input_paths: Optional[List[str]] = None,
@@ -498,6 +513,20 @@ class NanoBananaImageGenerator:
         """
         Generate ``num_views`` new views of the room and consolidate all images
         (originals + generated) into ``output_dir`` as JPEG files ready for COLMAP.
+
+        Resolution strategy
+        -------------------
+        Generated images are kept at the model's **native output size** — no
+        post-generation upscaling or aspect-ratio warping.  The first generated
+        frame determines the canonical size; all input images (corner photos) are
+        then downscaled to that same size before being written to ``output_dir``.
+        This guarantees every file fed to DUSt3R / COLMAP is pixel-for-pixel the
+        same resolution.
+
+        If ``output_size`` is supplied it acts as an *upper-bound override*: the
+        generated image will only be resized if it is strictly larger than the
+        requested size (i.e. true downscaling only).  Leave it as ``None``
+        (default) to let the model decide.
 
         Cache behaviour (``use_cache=True``)
         -------------------------------------
@@ -520,7 +549,9 @@ class NanoBananaImageGenerator:
                            ensure COLMAP-compatible ≥60% frame overlap.
             output_dir:    Folder where all JPEGs are written.
                            Defaults to ``data/Nano_banana_output_images``.
-            output_size:   (width, height) for each generated image.
+            output_size:   Optional (width, height) cap. Only downscales; never
+                           upscales or changes aspect ratio. ``None`` = use model
+                           native size.
             chain_views:   If True, feed each generated view back as a reference
                            for the next call (reduces cross-view drift).
             use_cache:     If True, skip generation when images already exist.
@@ -569,32 +600,33 @@ class NanoBananaImageGenerator:
                     logger.info(f"Loaded cached view: {p.name}")
                 return cached
 
-        # ── Copy original input images as JPEG ───────────────────────────────
-        for i, img_arr in enumerate(input_images):
-            if input_paths and i < len(input_paths):
-                stem = Path(input_paths[i]).stem
-            else:
-                stem = f"input_view_{i:02d}"
-            dest = out_path / f"{stem}.jpg"
-            img_u8 = img_arr if img_arr.dtype == np.uint8 else (img_arr * 255).astype(np.uint8)
-            Image.fromarray(img_u8).save(dest, format="JPEG", quality=95)
-            logger.info(f"Copied input image to: {dest.name}")
-
-        # ── Generate and save new views as JPEG ──────────────────────────────
+        # ── Generate views first so we know the model's native output size ────
+        # The canonical size is taken from the first successful generation.
+        # Input copies are written afterward at that same size.
         generated: List[np.ndarray] = []
+        canonical_size: Optional[Tuple[int, int]] = None  # (width, height)
         reference_pool = list(input_images)
         completed_specs: List[str] = []
 
         for i, spec in enumerate(specs):
             logger.info(f"Generating view {i + 1}/{num_views}")
             try:
-                img = self.generate_viewpoint(
+                img, native_size = self.generate_viewpoint(
                     reference_images=reference_pool,
                     view_spec=spec,
                     scene_description=scene_description,
-                    output_size=output_size,
+                    output_size=output_size,  # None → keep native; else downscale only
                     prior_specs=completed_specs if completed_specs else None,
                 )
+
+                # Lock in canonical size from first successful generation
+                actual_size: Tuple[int, int] = (img.shape[1], img.shape[0])  # (W, H)
+                if canonical_size is None:
+                    canonical_size = actual_size
+                    logger.info(
+                        f"Canonical output size set to {canonical_size[0]}x{canonical_size[1]} "
+                        f"(Gemini native: {native_size[0]}x{native_size[1]})"
+                    )
 
                 generated.append(img)
                 completed_specs.append(spec)
@@ -610,10 +642,36 @@ class NanoBananaImageGenerator:
                 logger.error(f"Failed to generate view {i}: {e}")
                 continue
 
+        # Fall back to output_size (or 1024×1024) if all generations failed
+        if canonical_size is None:
+            canonical_size = output_size or (1024, 1024)
+            logger.warning(
+                f"No views generated; falling back to canonical size {canonical_size[0]}x{canonical_size[1]}"
+            )
+
+        # ── Write input images at canonical size ─────────────────────────────
+        for i, img_arr in enumerate(input_images):
+            if input_paths and i < len(input_paths):
+                stem = Path(input_paths[i]).stem
+            else:
+                stem = f"input_view_{i:02d}"
+            dest = out_path / f"{stem}.jpg"
+            img_u8 = img_arr if img_arr.dtype == np.uint8 else (img_arr * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_u8)
+            orig_w, orig_h = pil_img.size
+            if (orig_w, orig_h) != canonical_size:
+                pil_img = pil_img.resize(canonical_size, Image.Resampling.LANCZOS)
+                logger.info(
+                    f"Downscaled input image {i} from {orig_w}x{orig_h} "
+                    f"→ {canonical_size[0]}x{canonical_size[1]} (canonical size)"
+                )
+            pil_img.save(dest, format="JPEG", quality=95)
+            logger.info(f"Saved input image to: {dest.name}")
+
         logger.info(
             f"Generated {len(generated)}/{num_views} views "
             f"({'with' if chain_views else 'without'} sequential conditioning). "
-            f"All images saved to '{output_dir}'."
+            f"All images saved to '{output_dir}' at {canonical_size[0]}x{canonical_size[1]}."
         )
         return generated
 

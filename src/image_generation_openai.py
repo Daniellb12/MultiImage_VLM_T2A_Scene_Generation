@@ -440,9 +440,9 @@ class OpenAIImageGenerator:
         reference_images: List[np.ndarray],
         view_spec: str,
         scene_description: str,
-        output_size: Tuple[int, int] = (1024, 1024),
+        output_size: Optional[Tuple[int, int]] = None,
         prior_specs: Optional[List[str]] = None,
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, Tuple[int, int]]:
         """
         Generate one new view using the OpenAI images.generate endpoint.
 
@@ -457,12 +457,16 @@ class OpenAIImageGenerator:
                               compatibility with NanoBananaImageGenerator.
             view_spec:         Camera-explicit position description.
             scene_description: Full Stage-1 structured report.
-            output_size:       (width, height) to resize the output to.
+            output_size:       If given, downscale the generated image to this
+                               (width, height). ``None`` keeps the model native
+                               size. Upscaling is never applied.
             prior_specs:       Already-generated angle descriptions injected
                                into the prompt to prevent duplicates.
 
         Returns:
-            Generated image as uint8 numpy array (H, W, 3).
+            Tuple of:
+              - Generated image as uint8 numpy array (H, W, 3).
+              - Native (width, height) reported by the model before any resize.
         """
         logger.info(f"Generating view: {view_spec[:80]}...")
 
@@ -480,10 +484,17 @@ class OpenAIImageGenerator:
             b64 = result.data[0].b64_json
             image_bytes = base64.b64decode(b64)
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
-            image = image.resize(output_size, Image.Resampling.LANCZOS)
+            native_size: Tuple[int, int] = image.size  # (width, height)
+            logger.info(f"Model native output size: {native_size[0]}x{native_size[1]}")
+            if output_size is not None and output_size != native_size:
+                logger.info(
+                    f"Resizing generated image {native_size[0]}x{native_size[1]} "
+                    f"→ {output_size[0]}x{output_size[1]}"
+                )
+                image = image.resize(output_size, Image.Resampling.LANCZOS)
             arr = np.array(image)
             logger.info(f"Generated image shape: {arr.shape}")
-            return arr
+            return arr, native_size
 
         except Exception as e:
             logger.error(f"Error generating viewpoint: {e}")
@@ -499,7 +510,7 @@ class OpenAIImageGenerator:
         scene_description: str,
         num_views: int = 6,
         output_dir: str = "data/Nano_banana_output_images",
-        output_size: Tuple[int, int] = (1024, 1024),
+        output_size: Optional[Tuple[int, int]] = None,
         chain_views: bool = True,
         use_cache: bool = True,
         input_paths: Optional[List[str]] = None,
@@ -507,6 +518,10 @@ class OpenAIImageGenerator:
         """
         Generate ``num_views`` new views and write all images to ``output_dir``
         as JPEG files ready for COLMAP.
+
+        Resolution strategy mirrors NanoBananaImageGenerator: views are generated
+        first at the model's native size, the canonical size is locked from the
+        first frame, and input images are then downscaled to match.
 
         ``chain_views=True`` feeds each generated view back into the reference
         pool for the next call, giving the model progressively more context.
@@ -553,32 +568,30 @@ class OpenAIImageGenerator:
                     logger.info(f"Loaded cached view: {p.name}")
                 return cached
 
-        # ── Copy original input images as JPEG ───────────────────────────────
-        for i, img_arr in enumerate(input_images):
-            if input_paths and i < len(input_paths):
-                stem = Path(input_paths[i]).stem
-            else:
-                stem = f"input_view_{i:02d}"
-            dest = out_path / f"{stem}.jpg"
-            img_u8 = img_arr if img_arr.dtype == np.uint8 else (img_arr * 255).astype(np.uint8)
-            Image.fromarray(img_u8).save(dest, format="JPEG", quality=95)
-            logger.info(f"Copied input image to: {dest.name}")
-
-        # ── Generate and save new views as JPEG ──────────────────────────────
+        # ── Generate views first to discover the model's native output size ──
         generated: List[np.ndarray] = []
+        canonical_size: Optional[Tuple[int, int]] = None  # (width, height)
         reference_pool = list(input_images)
         completed_specs: List[str] = []
 
         for i, spec in enumerate(specs):
             logger.info(f"Generating view {i + 1}/{num_views}")
             try:
-                img = self.generate_viewpoint(
+                img, native_size = self.generate_viewpoint(
                     reference_images=reference_pool,
                     view_spec=spec,
                     scene_description=scene_description,
                     output_size=output_size,
                     prior_specs=completed_specs if completed_specs else None,
                 )
+
+                actual_size: Tuple[int, int] = (img.shape[1], img.shape[0])
+                if canonical_size is None:
+                    canonical_size = actual_size
+                    logger.info(
+                        f"Canonical output size set to {canonical_size[0]}x{canonical_size[1]} "
+                        f"(model native: {native_size[0]}x{native_size[1]})"
+                    )
 
                 generated.append(img)
                 completed_specs.append(spec)
@@ -594,8 +607,33 @@ class OpenAIImageGenerator:
                 logger.error(f"Failed to generate view {i}: {e}")
                 continue
 
+        if canonical_size is None:
+            canonical_size = output_size or (1024, 1024)
+            logger.warning(
+                f"No views generated; falling back to canonical size {canonical_size[0]}x{canonical_size[1]}"
+            )
+
+        # ── Write input images at canonical size ─────────────────────────────
+        for i, img_arr in enumerate(input_images):
+            if input_paths and i < len(input_paths):
+                stem = Path(input_paths[i]).stem
+            else:
+                stem = f"input_view_{i:02d}"
+            dest = out_path / f"{stem}.jpg"
+            img_u8 = img_arr if img_arr.dtype == np.uint8 else (img_arr * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_u8)
+            orig_w, orig_h = pil_img.size
+            if (orig_w, orig_h) != canonical_size:
+                pil_img = pil_img.resize(canonical_size, Image.Resampling.LANCZOS)
+                logger.info(
+                    f"Downscaled input image {i} from {orig_w}x{orig_h} "
+                    f"→ {canonical_size[0]}x{canonical_size[1]} (canonical size)"
+                )
+            pil_img.save(dest, format="JPEG", quality=95)
+            logger.info(f"Saved input image to: {dest.name}")
+
         logger.info(
             f"Generated {len(generated)}/{num_views} views. "
-            f"All images saved to '{output_dir}'."
+            f"All images saved to '{output_dir}' at {canonical_size[0]}x{canonical_size[1]}."
         )
         return generated
