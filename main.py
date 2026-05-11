@@ -15,7 +15,8 @@ from src.utils import (
     load_config,
     create_output_directories,
     load_images_from_directory,
-    save_json
+    load_pipeline_view_images,
+    save_json,
 )
 from src.image_generation import ImageGenerator
 from src.reconstruction import reconstruct_scene
@@ -145,7 +146,20 @@ class Pipeline:
             self.generate_views()
         else:
             self.logger.info("\n[2/5] Skipping image generation")
-            self.state['all_images'] = self.state['input_images']
+            gen_dir = self.config.get('image_generation', {}).get(
+                'output_dir', self.directories['generated']
+            )
+            disk_imgs, _ = load_pipeline_view_images(gen_dir)
+            if disk_imgs:
+                self.state['all_images'] = disk_imgs
+                self.logger.info(
+                    f"Loaded {len(disk_imgs)} image(s) from {gen_dir} for downstream steps"
+                )
+            else:
+                self.logger.warning(
+                    f"No images in {gen_dir} — falling back to input images only"
+                )
+                self.state['all_images'] = self.state['input_images']
         
         # Step 3: 3D Reconstruction
         if not self.args.skip_reconstruction:
@@ -214,18 +228,25 @@ class Pipeline:
             self.state['scene_description'] = scene_description
             self.logger.info(f"Scene: {scene_description[:200]}...")
             
+            gen_dir = self.config['image_generation'].get(
+                'output_dir', self.directories['generated']
+            )
             # Generate additional views with sequential conditioning
             generated_images = generator.generate_additional_views(
                 input_images=self.state['input_images'],
                 scene_description=scene_description,
                 num_views=self.config['image_generation']['num_additional_views'],
-                output_dir=self.directories['generated'],
+                output_dir=gen_dir,
                 output_size=tuple(self.config['image_generation']['output_size']),
                 chain_views=self.config['image_generation'].get('chain_views', True),
+                input_paths=self.state.get('input_paths'),
             )
-            
+
             self.state['generated_images'] = generated_images
-            self.state['all_images'] = self.state['input_images'] + generated_images
+            disk_imgs, _ = load_pipeline_view_images(gen_dir)
+            self.state['all_images'] = (
+                disk_imgs if disk_imgs else self.state['input_images'] + generated_images
+            )
             
             self.logger.info(f"✓ Generated {len(generated_images)} additional views")
             self.logger.info(f"✓ Total images: {len(self.state['all_images'])}")
@@ -238,11 +259,24 @@ class Pipeline:
     def reconstruct_3d(self):
         """Run 3D reconstruction"""
         try:
+            gen_dir = self.config.get('image_generation', {}).get(
+                'output_dir', self.directories['generated']
+            )
+            recon_images, recon_paths = load_pipeline_view_images(gen_dir)
+            if not recon_images:
+                raise FileNotFoundError(
+                    f"No images found in '{gen_dir}' — run image generation first "
+                    "or populate that folder."
+                )
+            self.logger.info(
+                f"Reconstructing from {len(recon_images)} image(s) in {gen_dir} "
+                "(not from raw input/)"
+            )
             results = reconstruct_scene(
-                images=self.state['all_images'],
-                image_paths=self.state.get('input_paths'),
+                images=recon_images,
+                image_paths=recon_paths,
                 config=self.config['reconstruction'],
-                output_dir=self.directories['reconstruction']
+                output_dir=self.directories['reconstruction'],
             )
             
             self.state['reconstruction_results'] = results
@@ -315,9 +349,11 @@ class Pipeline:
     def generate_audio(self):
         """Generate audio for detected objects"""
         try:
+            _audio = self.config.get('audio', {})
             generator = AudioGenerator(
-                use_local=self.config['audio']['use_local_inference'],
-                sample_rate=self.config['audio']['sample_rate']
+                sample_rate=_audio.get('sample_rate', 44100),
+                use_local_inference=_audio.get('use_local_inference', False),
+                mmaudio_repo=_audio.get('mmaudio_repo'),
             )
             
             # Use 3D objects if available, otherwise use 2D segmentation

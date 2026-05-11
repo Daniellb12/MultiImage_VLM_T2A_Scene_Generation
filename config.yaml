@@ -21,8 +21,8 @@ image_generation:
   # num_additional_views: minimum for >=60% overlap with 65° HFOV = 12 (30° spacing).
   # Formula: ceil(360 / (2*degrees(arcsin(tan(HFOV/2)*(1-overlap)))))
   # Increase for wider FOV or higher overlap requirement.
-  num_additional_views: 20
-  output_size: [1024, 1024]
+  num_additional_views: 12
+  output_size: [1440, 1080]
   chain_views: true        # each generated view is fed back as a reference for the next
   output_dir: "data/Nano_banana_output_images"
   use_cache: true          # reuse previously generated images if they exist
@@ -60,7 +60,10 @@ audio:
   generation_model: "mmaudio"
   clip_duration: 4.0
   sample_rate: 44100
-  use_local_inference: false
+  # true = local clone only (no HF Space GPU); false = try local then HF Space fallback
+  use_local_inference: true
+  # Optional: path to cloned https://github.com/hkchengrex/MMAudio (else MMAUDIO_ROOT env or <project>/MMAudio)
+  # mmaudio_repo: null
   negative_prompt: "music, speech, singing"
   
 spatial_audio:

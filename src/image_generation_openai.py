@@ -29,6 +29,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
+from src.utils import save_rgb_jpeg_at_size
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -548,21 +550,28 @@ class OpenAIImageGenerator:
                 )
                 cached: List[np.ndarray] = []
                 for p in existing:
-                    img = np.array(Image.open(p).convert("RGB"))
+                    with Image.open(p) as im:
+                        pil = im.convert("RGB")
+                        if pil.size != output_size:
+                            pil = pil.resize(output_size, Image.Resampling.LANCZOS)
+                            pil.save(p, format="JPEG", quality=95)
+                            logger.info(
+                                f"Resized cached image to {output_size[0]}×{output_size[1]}: {p.name}"
+                            )
+                        img = np.array(pil)
                     cached.append(img)
                     logger.info(f"Loaded cached view: {p.name}")
                 return cached
 
-        # ── Copy original input images as JPEG ───────────────────────────────
+        # ── Copy originals resized to ``output_size`` (match generated views) ─
         for i, img_arr in enumerate(input_images):
             if input_paths and i < len(input_paths):
                 stem = Path(input_paths[i]).stem
             else:
                 stem = f"input_view_{i:02d}"
             dest = out_path / f"{stem}.jpg"
-            img_u8 = img_arr if img_arr.dtype == np.uint8 else (img_arr * 255).astype(np.uint8)
-            Image.fromarray(img_u8).save(dest, format="JPEG", quality=95)
-            logger.info(f"Copied input image to: {dest.name}")
+            save_rgb_jpeg_at_size(img_arr, dest, output_size, quality=95)
+            logger.info(f"Saved input view (resized to {output_size[0]}×{output_size[1]}): {dest.name}")
 
         # ── Generate and save new views as JPEG ──────────────────────────────
         generated: List[np.ndarray] = []
@@ -584,7 +593,7 @@ class OpenAIImageGenerator:
                 completed_specs.append(spec)
 
                 dest = out_path / f"generated_view_{i:02d}.jpg"
-                Image.fromarray(img).save(dest, format="JPEG", quality=95)
+                save_rgb_jpeg_at_size(img, dest, output_size, quality=95)
                 logger.info(f"Saved generated view to: {dest.name}")
 
                 if chain_views:

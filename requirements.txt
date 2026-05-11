@@ -16,6 +16,8 @@ numpy>=1.24.0
 scipy>=1.11.0
 
 # 3D Processing & Visualization
+einops>=0.7.0
+roma>=1.5.0
 open3d>=0.18.0
 timm>=0.9.0
 

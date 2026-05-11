@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -11,15 +12,56 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Path to the cloned MMAudio repo — weights are downloaded relative to this dir.
-MMAUDIO_REPO = Path(__file__).resolve().parents[1].parent / "MMAudio"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Windows / POSIX: characters not allowed in file names
+_INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_label_for_audio_filename(label: str, max_len: int = 100) -> str:
+    """Turn an object label into a safe single path component (no extension)."""
+    raw = (label or "unknown").strip().lower()
+    raw = _INVALID_FS_CHARS.sub("", raw)
+    raw = re.sub(r"\s+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("._ ")
+    if not raw:
+        raw = "unknown"
+    return raw[:max_len]
+
+
+def _next_labeled_audio_stem(label: str, slug_counts: Dict[str, int]) -> str:
+    """First occurrence ``slug``; repeats ``slug_001``, ``slug_002``, … (3-digit)."""
+    slug = _sanitize_label_for_audio_filename(label)
+    slug_counts[slug] = slug_counts.get(slug, 0) + 1
+    n = slug_counts[slug]
+    if n == 1:
+        return slug
+    return f"{slug}_{n - 1:03d}"
+
+
+def resolve_mmaudio_repo(explicit: Optional[str] = None) -> Path:
+    """Resolve the cloned [MMAudio](https://github.com/hkchengrex/MMAudio) checkout directory.
+
+    Precedence: ``explicit`` argument → ``MMAUDIO_ROOT`` env var → ``<project_root>/MMAudio``.
+    """
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_absolute():
+            p = (_PROJECT_ROOT / p).resolve()
+        return p.resolve()
+    env = os.environ.get("MMAUDIO_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return (_PROJECT_ROOT / "MMAudio").resolve()
 
 
 # ── Local inference helpers ────────────────────────────────────────────────────
 
-def _load_local_model(variant: str = "medium_44k", device: str = "cuda"):
-#def _load_local_model(variant: str = "large_44k_v2", device: str = "cuda"):
-
+def _load_local_model(
+    repo: Path,
+    variant: str = "medium_44k",
+    device: str = "cuda",
+):
     """Load MMAudio model weights into memory.  Returns (net, feature_utils, fm, seq_cfg)."""
     import torch
     from mmaudio.eval_utils import all_model_cfg
@@ -27,9 +69,15 @@ def _load_local_model(variant: str = "medium_44k", device: str = "cuda"):
     from mmaudio.model.networks import get_my_mmaudio
     from mmaudio.model.utils.features_utils import FeaturesUtils
 
+    if not repo.is_dir():
+        raise FileNotFoundError(
+            f"MMAudio repo not found at {repo}. Clone with:\n"
+            f"  git clone https://github.com/hkchengrex/MMAudio.git \"{repo}\""
+        )
+
     # Weights paths inside MMAudio repo are relative — cd into the repo first.
     orig_cwd = Path.cwd()
-    os.chdir(MMAUDIO_REPO)
+    os.chdir(repo)
     try:
         model_cfg = all_model_cfg[variant]
         model_cfg.download_if_needed()
@@ -72,7 +120,6 @@ def _load_local_model(variant: str = "medium_44k", device: str = "cuda"):
     return net, feature_utils, fm, seq_cfg
 
 
-@staticmethod
 def _run_local(
     prompt: str,
     negative_prompt: str,
@@ -115,46 +162,82 @@ def _run_local(
 class AudioGenerator:
     """Generate foley audio using MMAudio.
 
-    Tries local GPU inference first; falls back to the HuggingFace Gradio Space
-    if the local model cannot be loaded (e.g. mmaudio package not found, or
-    ``force_api=True`` is passed).
+    * ``use_local_inference=True`` — load the cloned repo only; on failure raise
+      (no Hugging Face Space GPU fallback).
+    * ``use_local_inference=False`` — try local first, then fall back to the
+      public Gradio Space ``hkchengrex/MMAudio`` if local load fails.
+    * ``force_api=True`` — skip local and use the Space API only.
     """
 
     def __init__(
         self,
         variant: str = "medium_44k",
         force_api: bool = False,
+        use_local_inference: bool = False,
+        mmaudio_repo: Optional[str] = None,
         space_name: str = "hkchengrex/MMAudio",
         sample_rate: int = 44100,
     ):
         self.sample_rate = sample_rate
+        self._mmaudio_repo = resolve_mmaudio_repo(mmaudio_repo)
         self._net = self._feature_utils = self._fm = self._seq_cfg = None
         self._device = None
         self._use_local = False
         self._client = None
 
-        if not force_api:
+        if force_api:
+            self._init_hf_space(space_name)
+            return
+
+        if use_local_inference:
             try:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
-                self._net, self._feature_utils, self._fm, self._seq_cfg = \
-                    _load_local_model(variant=variant, device=device)
+                self._net, self._feature_utils, self._fm, self._seq_cfg = _load_local_model(
+                    self._mmaudio_repo, variant=variant, device=device
+                )
                 self._device = device
                 self._use_local = True
-                logger.info("AudioGenerator: using LOCAL MMAudio inference")
-            except Exception as e:
-                logger.warning(f"Local MMAudio unavailable ({e}), falling back to HF Space API")
-
-        if not self._use_local:
-            try:
-                from gradio_client import Client
-                self._client = Client(space_name)
-                logger.info(f"AudioGenerator: using HF Space API ({space_name})")
+                logger.info(
+                    f"AudioGenerator: LOCAL MMAudio ({variant}) from {self._mmaudio_repo}"
+                )
             except Exception as e:
                 raise RuntimeError(
-                    f"Cannot initialise AudioGenerator — local load failed and "
-                    f"Gradio client also failed: {e}"
+                    "Local MMAudio failed and use_local_inference=True "
+                    "(no Hugging Face Space fallback).\n"
+                    f"  Repo path: {self._mmaudio_repo}\n"
+                    "  Install: git clone https://github.com/hkchengrex/MMAudio.git "
+                    f'"{self._mmaudio_repo}" then pip install -e . inside that folder.\n'
+                    f"  Underlying error: {e}"
                 ) from e
+            return
+
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._net, self._feature_utils, self._fm, self._seq_cfg = _load_local_model(
+                self._mmaudio_repo, variant=variant, device=device
+            )
+            self._device = device
+            self._use_local = True
+            logger.info(
+                f"AudioGenerator: using LOCAL MMAudio ({variant}) from {self._mmaudio_repo}"
+            )
+        except Exception as e:
+            logger.warning(f"Local MMAudio unavailable ({e}), falling back to HF Space API")
+
+        if not self._use_local:
+            self._init_hf_space(space_name)
+
+    def _init_hf_space(self, space_name: str) -> None:
+        try:
+            from gradio_client import Client
+            self._client = Client(space_name)
+            logger.info(f"AudioGenerator: using HF Space API ({space_name})")
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot initialise Hugging Face Gradio client for {space_name}: {e}"
+            ) from e
 
     # ── core generation ────────────────────────────────────────────────────────
 
@@ -193,7 +276,7 @@ class AudioGenerator:
         import torchaudio
 
         orig_cwd = Path.cwd()
-        os.chdir(MMAUDIO_REPO)
+        os.chdir(self._mmaudio_repo)
         try:
             # Use no_grad (not inference_mode) so the euler ODE loop inside
             # MMAudio's FlowMatching can still perform in-place tensor ops
@@ -320,11 +403,12 @@ class AudioGenerator:
         logger.info(f"Generating audio for {len(objects)} objects")
         os.makedirs(output_dir, exist_ok=True)
 
+        slug_counts: Dict[str, int] = {}
         results = []
         for i, obj in enumerate(objects):
             label = obj.get("label", "unknown")
-            obj_id = obj.get("id", f"obj_{i:03d}")
-            output_path = os.path.join(output_dir, f"{obj_id}.wav")
+            stem = _next_labeled_audio_stem(label, slug_counts)
+            output_path = os.path.join(output_dir, f"{stem}.wav")
 
             # Skip if already generated
             if os.path.exists(output_path):

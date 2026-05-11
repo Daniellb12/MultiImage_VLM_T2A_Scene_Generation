@@ -4,7 +4,8 @@ import os
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+import re
+from typing import Dict, Any, List, Tuple, Union
 import numpy as np
 from PIL import Image
 import json
@@ -43,6 +44,42 @@ def load_json(filepath: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+_VIEW_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+
+
+def _pipeline_view_sort_key(path: Path) -> Tuple[int, int, str]:
+    """Non-generated files first (lexicographic), then ``generated_view_XX`` by index."""
+    name_lower = path.name.lower()
+    m = re.match(r'generated_view_(\d+)\.', name_lower)
+    if m:
+        return (1, int(m.group(1)), path.name)
+    return (0, 0, path.name)
+
+
+def load_pipeline_view_images(directory: str) -> Tuple[List[np.ndarray], List[str]]:
+    """Load all RGB views from the unified synthesis folder (e.g. ``Nano_banana_output_images``).
+
+    Used for reconstruction and downstream steps so every frame shares the same
+    pixel resolution as written by the image-generation stage. Does not read
+    ``data/input`` — only files inside ``directory``.
+    """
+    root = Path(directory)
+    if not root.is_dir():
+        return [], []
+
+    paths = [p for p in root.iterdir() if p.suffix.lower() in _VIEW_IMAGE_EXTS]
+    paths.sort(key=_pipeline_view_sort_key)
+
+    images: List[np.ndarray] = []
+    str_paths: List[str] = []
+    for p in paths:
+        with Image.open(p) as im:
+            images.append(np.array(im.convert('RGB')))
+        str_paths.append(str(p))
+
+    return images, str_paths
+
+
 def load_images_from_directory(directory: str) -> List[np.ndarray]:
     """Load all images from a directory"""
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
@@ -65,6 +102,23 @@ def save_image(image: np.ndarray, filepath: str) -> None:
     if image.dtype != np.uint8:
         image = (image * 255).astype(np.uint8)
     Image.fromarray(image).save(filepath)
+
+
+def save_rgb_jpeg_at_size(
+    img_arr: np.ndarray,
+    dest: Union[str, Path],
+    size: Tuple[int, int],
+    quality: int = 95,
+) -> None:
+    """Save ``H×W×3`` RGB as JPEG, resizing to ``size`` (width, height) if needed."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if img_arr.dtype != np.uint8:
+        img_arr = (np.clip(img_arr, 0.0, 1.0) * 255).astype(np.uint8)
+    pil = Image.fromarray(img_arr).convert("RGB")
+    if pil.size != size:
+        pil = pil.resize(size, Image.Resampling.LANCZOS)
+    pil.save(dest, format="JPEG", quality=quality)
 
 
 def create_output_directories(base_path: str = "data") -> Dict[str, str]:

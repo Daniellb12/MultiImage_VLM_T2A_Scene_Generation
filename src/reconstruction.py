@@ -463,10 +463,14 @@ def reconstruct_scene(
                 config=config,
                 output_dir=output_dir,
             )
+            # Preserve MiDaS depth maps: reconstruct_with_dust3r returns
+            # depth_maps=None because DUSt3R doesn't compute them.
+            # results.update() would overwrite the MiDaS list computed in
+            # Step 1, so we save and restore it explicitly.
+            _midas_depth_maps = results.get('depth_maps')
             results.update(dust3r_results)
-            # Re-attach depth maps from Step 1 (DUSt3R doesn't produce them)
-            if results.get('depth_maps') is None and 'depth_maps' in results:
-                pass  # already None
+            if _midas_depth_maps is not None:
+                results['depth_maps'] = _midas_depth_maps
             logger.info("DUSt3R reconstruction completed successfully")
         except Exception as e:
             logger.error(f"DUSt3R reconstruction failed: {e}")
@@ -549,10 +553,10 @@ def reconstruct_scene(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
-    # Example usage
-    from src.utils import load_images_from_directory
+    # Example usage — same folder as Stage 2 (`image_generation.output_dir` in config.yaml)
+    from src.utils import load_pipeline_view_images
     
-    images, paths = load_images_from_directory("data/input")
+    images, paths = load_pipeline_view_images("data/Nano_banana_output_images")
     print(f"Loaded {len(images)} images")
     
     results = reconstruct_scene(images, paths)

@@ -478,6 +478,7 @@ def project_objects_to_3d(
         # Get depth map if available
         depth_map = depth_maps[image_idx] if depth_maps and image_idx < len(depth_maps) else None
 
+        per_image_count = 0  # reset for every source image
         for obj in result.get('objects', []):
             if 'bbox' not in obj:
                 continue
@@ -508,7 +509,10 @@ def project_objects_to_3d(
             )
 
             obj_3d = {
-                'id': f"obj_{image_idx:03d}_{len(objects_3d):03d}",
+                # Use per-image counter so IDs match the scheme used by
+                # main.py (line 330), the notebook rebuild step, and audio
+                # Stable id for 3-D / diagnostics; audio files use label-based names (see audio_generation).
+                'id': f"obj_{image_idx:03d}_{per_image_count:03d}",
                 'label': obj.get('label', 'unknown'),
                 'category': obj.get('category', 'unknown'),
                 'confidence': obj.get('confidence', 0.0),
@@ -521,6 +525,7 @@ def project_objects_to_3d(
             }
 
             objects_3d.append(obj_3d)
+            per_image_count += 1
 
     logger.info(f"Projected {len(objects_3d)} objects to 3D space")
     return objects_3d
