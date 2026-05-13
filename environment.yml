@@ -78,3 +78,23 @@ dependencies:
     - gradio-client>=0.10.0
     - soundfile>=0.12.0
     - librosa>=0.10.0
+
+# ── Optional: 3D Gaussian Splatting env (Nerfstudio splatfacto) ──────────────
+# Keep SEPARATE from MVTSG to avoid torch/CUDA version conflicts.
+# Run these commands once in a terminal (outside this environment):
+#
+#   conda create -n nerfstudio python=3.10 -y
+#   conda activate nerfstudio
+#   pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
+#       --index-url https://download.pytorch.org/whl/cu118
+#   pip install nerfstudio
+#   ns-install-cli
+#
+# After training completes you can view results with:
+#   ns-viewer --load-config <run>/config.yml
+#
+# Stage 7 in pipeline.ipynb calls Nerfstudio via subprocess
+# (conda run -n nerfstudio ns-train splatfacto ...) so the MVTSG kernel
+# never needs nerfstudio installed.
+# Set  gaussian_splatting.env_name: null  in config.yaml to skip training
+# and only generate the transforms.json bridge file.

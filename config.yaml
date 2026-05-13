@@ -71,6 +71,49 @@ spatial_audio:
   intensity_falloff: "inverse_square"
   default_intensity: 0.8
   
+gaussian_splatting:
+  # Set to false to skip Stage 7 (GS training) entirely
+  enabled: true
+  # Conda environment that has Nerfstudio installed (ns-train / ns-export).
+  # Set to null to only write transforms.json without training.
+  env_name: "nerfstudio"
+  max_iters: 10000
+  # Directory where transforms.json and images/ are written (bridge output)
+  data_dir: "data/reconstruction/3dgs/data"
+  # Root output directory for Nerfstudio training artefacts
+  output_dir: "data/reconstruction/3dgs"
+  # Final exported Gaussian PLY path
+  exported_ply: "data/reconstruction/3dgs/gs_scene.ply"
+  # Set to true to wipe previous splatfacto checkpoints before each run so
+  # training always starts fresh (important after changing coordinate convention).
+  fresh_start: true
+  # Extra CLI arguments forwarded verbatim to ns-train splatfacto.
+  # --pipeline.model.* dotted args work here; dataparser args need
+  # the "nerfstudio-data --flag val" subcommand form instead.
+  extra_args:
+    - "--pipeline.model.use-scale-regularization"
+    - "True"
+  # Post-training floater removal.  Runs automatically after each export.
+  # Set enabled: false to skip (and use gs_scene.ply directly).
+  cleanup:
+    enabled: true
+    min_opacity: 0.05        # remove Gaussians with sigmoid(opacity) < this
+    max_scale: 0.5           # remove Gaussians larger than this in world units
+    outlier_nb_neighbors: 20 # neighbourhood size for statistical outlier test
+    outlier_std_ratio: 2.0   # std-dev multiplier for outlier test
+    bbox_margin: 1.5         # expand camera-rig bounding box by this factor
+
+audio_placement:
+  # YAML file that persists the user's audio-source selection
+  placement_file: "data/output/audio_placement.yaml"
+  # Composite PLY (Gaussians + audio-source markers)
+  composite_ply: "data/output/gs_scene_with_audio.ply"
+  # Unity-ready JSON export
+  unity_export: "data/output/unity_scene_gs.json"
+  # Radius (world units) of the sphere markers in the composite PLY
+  marker_radius: 0.1
+  default_intensity: 0.8
+
 output:
   save_intermediate: true
   visualization: true

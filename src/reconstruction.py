@@ -547,7 +547,82 @@ def reconstruct_scene(
             "(fx=fy=0.7*W, identity extrinsics)"
         )
 
+    # Persist camera_data to disk so Stage 7 can reload it without re-running Stage 3
+    if results.get('camera_data'):
+        _cam_json = os.path.join(output_dir, "camera_data.json")
+        try:
+            save_camera_data(results['camera_data'], _cam_json)
+            logger.info(f"Camera data persisted to {_cam_json}")
+        except Exception as _e:
+            logger.warning(f"Could not save camera_data to disk: {_e}")
+
     return results
+
+
+def save_camera_data(camera_data: Dict, path: str) -> None:
+    """Serialize ``camera_data`` (numpy arrays, int keys) to JSON.
+
+    Args:
+        camera_data: Dict with keys ``intrinsics``, ``extrinsics``,
+                     ``image_names``, ``camera_centers``, and optional flags.
+        path:        Destination JSON path.
+    """
+    import json as _json
+
+    def _to_serializable(v):
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            return float(v)
+        return v
+
+    def _dict_to_serial(d):
+        return {str(k): _to_serializable(v) for k, v in d.items()}
+
+    out = {
+        "intrinsics":     _dict_to_serial(camera_data.get("intrinsics", {})),
+        "extrinsics":     _dict_to_serial(camera_data.get("extrinsics", {})),
+        "image_names":    _dict_to_serial(camera_data.get("image_names", {})),
+        "camera_centers": _dict_to_serial(camera_data.get("camera_centers", {})),
+        "dust3r":         bool(camera_data.get("dust3r", False)),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump(out, fh, indent=2)
+
+
+def load_camera_data(path: str) -> Dict:
+    """Load ``camera_data`` saved by :func:`save_camera_data`.
+
+    Returns a dict with the same structure as ``reconstruct_scene`` produces,
+    with numpy array values and integer keys.
+
+    Args:
+        path: JSON path written by ``save_camera_data``.
+
+    Returns:
+        camera_data dict ready for ``export_dust3r_to_nerfstudio`` / ``project_objects_to_3d``.
+    """
+    import json as _json
+
+    with open(path, encoding="utf-8") as fh:
+        raw = _json.load(fh)
+
+    def _to_array(v):
+        return np.array(v, dtype=np.float64) if isinstance(v, list) else v
+
+    def _parse_dict(d, value_fn=_to_array):
+        return {int(k): value_fn(v) for k, v in d.items()}
+
+    return {
+        "intrinsics":     _parse_dict(raw.get("intrinsics", {})),
+        "extrinsics":     _parse_dict(raw.get("extrinsics", {})),
+        "image_names":    {int(k): v for k, v in raw.get("image_names", {}).items()},
+        "camera_centers": _parse_dict(raw.get("camera_centers", {})),
+        "dust3r":         raw.get("dust3r", False),
+    }
 
 
 if __name__ == "__main__":

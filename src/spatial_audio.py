@@ -494,6 +494,248 @@ def export_for_unity(
     return output_path
 
 
+def visualize_audio_scene_gs(
+    candidates,
+    gs_ply: Optional[str] = None,
+    output_path: str = "data/output/gs_scene_viewer.html",
+) -> str:
+    """Create an interactive HTML viewer for the 3DGS scene with audio playback.
+
+    Renders the Gaussian PLY as a particle cloud (sampled points) in Three.js,
+    overlays coloured spheres for each enabled audio source, and adds per-source
+    HTML5 ``<audio>`` controls below the 3D canvas.
+
+    Args:
+        candidates:   List of ``AudioPlacementCandidate`` from
+                      ``src.audio_placement.build_candidates``.
+        gs_ply:       Path to the Gaussian PLY (combined composite or raw GS).
+                      When present the first 50 000 points are embedded as
+                      inline JSON to avoid a separate file-serve step.
+        output_path:  Destination path for the HTML file.
+
+    Returns:
+        Path to the written HTML file.
+    """
+    # Collect enabled sources
+    enabled_sources = [c for c in candidates if c.enabled]
+
+    # ── Sample point cloud from PLY for inline embedding ──────────────────────
+    cloud_points_json = "[]"
+    cloud_colors_json = "[]"
+    if gs_ply and os.path.exists(gs_ply):
+        try:
+            import open3d as o3d
+            pcd = o3d.io.read_point_cloud(gs_ply)
+            pts = np.asarray(pcd.points)
+            cols = np.asarray(pcd.colors) if pcd.has_colors() else np.ones_like(pts) * 0.5
+            MAX_PTS = 50_000
+            if len(pts) > MAX_PTS:
+                idx = np.random.choice(len(pts), MAX_PTS, replace=False)
+                pts = pts[idx]
+                cols = cols[idx]
+            cloud_points_json = json.dumps(pts.tolist())
+            cloud_colors_json = json.dumps(cols.tolist())
+            logger.info(f"Embedded {len(pts):,} cloud points from {gs_ply}")
+        except Exception as exc:
+            logger.warning(f"Could not sample PLY for viewer: {exc}")
+
+    # ── Build JS array of audio sources ───────────────────────────────────────
+    src_js_list = []
+    for c in enabled_sources:
+        pos = c.final_position
+        intensity = c.final_intensity
+        # Use relative path so the HTML is portable inside the output folder
+        audio_rel = os.path.relpath(c.audio_file, os.path.dirname(output_path)).replace("\\", "/")
+        src_js_list.append(
+            f"{{id:{json.dumps(c.id)},label:{json.dumps(c.label)},"
+            f"audioFile:{json.dumps(audio_rel)},"
+            f"position:[{pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f}],"
+            f"intensity:{intensity:.4f}}}"
+        )
+    sources_js = "[" + ",\n".join(src_js_list) + "]"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3DGS Audio Scene Viewer</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }}
+  #header {{ padding: 8px 16px; background: #16213e; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }}
+  #header h2 {{ font-size: 1rem; color: #e94560; }}
+  #header span {{ font-size: 0.8rem; color: #aaa; }}
+  #main {{ display: flex; flex: 1; min-height: 0; }}
+  #viewport {{ flex: 1; position: relative; }}
+  canvas {{ display: block; width: 100%; height: 100%; }}
+  #panel {{ width: 300px; background: #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }}
+  #panel h3 {{ font-size: 0.9rem; margin-bottom: 8px; color: #e94560; }}
+  .src-card {{ background: #16213e; border-radius: 6px; padding: 10px; margin-bottom: 8px; border-left: 3px solid #e94560; }}
+  .src-label {{ font-size: 0.85rem; font-weight: bold; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .src-pos {{ font-size: 0.72rem; color: #aaa; margin-bottom: 6px; font-family: monospace; }}
+  audio {{ width: 100%; height: 28px; }}
+  #tooltip {{ position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,0.7); color: #eee; font-size: 0.75rem; padding: 6px 10px; border-radius: 4px; pointer-events: none; }}
+</style>
+</head>
+<body>
+<div id="header">
+  <h2>3DGS Audio Scene Viewer</h2>
+  <span id="stat">{len(enabled_sources)} audio source(s) &nbsp;|&nbsp; Drag to rotate &nbsp;|&nbsp; Scroll to zoom</span>
+</div>
+<div id="main">
+  <div id="viewport">
+    <canvas id="c"></canvas>
+    <div id="tooltip">Hover over a sphere to see label</div>
+  </div>
+  <div id="panel">
+    <h3>Audio Sources</h3>
+    <div id="src-list"></div>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── Data ──────────────────────────────────────────────────────────────────
+const CLOUD_PTS   = {cloud_points_json};
+const CLOUD_COLS  = {cloud_colors_json};
+const AUDIO_SRCS  = {sources_js};
+
+// ── Three.js Setup ────────────────────────────────────────────────────────
+const canvas   = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({{canvas, antialias: true, alpha: true}});
+renderer.setClearColor(0x1a1a2e, 1);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
+camera.position.set(0, 0, 5);
+
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// ── Point cloud ───────────────────────────────────────────────────────────
+if (CLOUD_PTS.length > 0) {{
+  const geo = new THREE.BufferGeometry();
+  const flat = []; const flatC = [];
+  for (let i = 0; i < CLOUD_PTS.length; i++) {{
+    flat.push(CLOUD_PTS[i][0], CLOUD_PTS[i][1], CLOUD_PTS[i][2]);
+    if (CLOUD_COLS.length > i) flatC.push(CLOUD_COLS[i][0], CLOUD_COLS[i][1], CLOUD_COLS[i][2]);
+    else flatC.push(0.5, 0.5, 0.5);
+  }}
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(flat, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(flatC, 3));
+  const mat = new THREE.PointsMaterial({{size: 0.012, vertexColors: true, sizeAttenuation: true}});
+  scene.add(new THREE.Points(geo, mat));
+}}
+
+// ── Audio source spheres ──────────────────────────────────────────────────
+const spheres = [];
+AUDIO_SRCS.forEach((src, idx) => {{
+  const i = src.intensity;
+  const geo  = new THREE.SphereGeometry(0.08, 24, 24);
+  const mat  = new THREE.MeshPhongMaterial({{color: new THREE.Color(i, 0.2, 1-i), emissive: new THREE.Color(i*0.3, 0, (1-i)*0.3)}});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(src.position[0], src.position[1], src.position[2]);
+  mesh.userData = {{label: src.label, idx}};
+  scene.add(mesh);
+  spheres.push(mesh);
+}});
+
+// ── Axes helper ───────────────────────────────────────────────────────────
+scene.add(new THREE.AxesHelper(0.5));
+
+// ── Resize ────────────────────────────────────────────────────────────────
+function resize() {{
+  const vp = document.getElementById('viewport');
+  const w = vp.clientWidth, h = vp.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Orbit controls (minimal) ──────────────────────────────────────────────
+let isDrag = false, lastX = 0, lastY = 0;
+let theta = 0, phi = Math.PI / 3, radius = 5;
+function updateCamera() {{
+  camera.position.set(
+    radius * Math.sin(phi) * Math.sin(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.cos(theta)
+  );
+  camera.lookAt(0, 0, 0);
+}}
+canvas.addEventListener('mousedown', e => {{ isDrag = true; lastX = e.clientX; lastY = e.clientY; }});
+canvas.addEventListener('mouseup',   () => isDrag = false);
+canvas.addEventListener('mouseleave',() => isDrag = false);
+canvas.addEventListener('mousemove', e => {{
+  if (!isDrag) {{ rayCast(e); return; }}
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  theta -= dx * 0.005; phi = Math.max(0.1, Math.min(Math.PI-0.1, phi - dy * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+  updateCamera();
+}});
+canvas.addEventListener('wheel', e => {{
+  radius = Math.max(0.5, Math.min(50, radius + e.deltaY * 0.01));
+  updateCamera();
+}});
+updateCamera();
+
+// ── Raycasting for hover ──────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const tooltip = document.getElementById('tooltip');
+function rayCast(e) {{
+  const vp = document.getElementById('viewport');
+  const rect = vp.getBoundingClientRect();
+  mouse.x =  ((e.clientX - rect.left) / rect.width)  * 2 - 1;
+  mouse.y = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(spheres);
+  if (hits.length > 0) {{
+    const {{label}} = hits[0].object.userData;
+    tooltip.textContent = label;
+    tooltip.style.opacity = 1;
+  }} else {{
+    tooltip.style.opacity = 0.5;
+    tooltip.textContent = 'Drag to rotate | Scroll to zoom';
+  }}
+}}
+
+// ── Audio source cards ────────────────────────────────────────────────────
+const list = document.getElementById('src-list');
+AUDIO_SRCS.forEach((src, idx) => {{
+  const p = src.position;
+  const card = document.createElement('div');
+  card.className = 'src-card';
+  card.innerHTML = `
+    <div class="src-label">${{src.label}}</div>
+    <div class="src-pos">[${{p[0].toFixed(2)}}, ${{p[1].toFixed(2)}}, ${{p[2].toFixed(2)}}]  intensity=${{src.intensity.toFixed(2)}}</div>
+    <audio controls preload="none" src="${{src.audioFile}}"></audio>
+  `;
+  card.addEventListener('mouseenter', () => spheres[idx].scale.setScalar(1.5));
+  card.addEventListener('mouseleave', () => spheres[idx].scale.setScalar(1.0));
+  list.appendChild(card);
+}});
+
+// ── Render loop ───────────────────────────────────────────────────────────
+(function animate() {{
+  requestAnimationFrame(animate);
+  renderer.render(scene, camera);
+}})();
+</script>
+</body>
+</html>"""
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    logger.info(f"GS audio viewer saved to: {output_path}")
+    return output_path
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
