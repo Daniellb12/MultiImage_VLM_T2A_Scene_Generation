@@ -498,6 +498,7 @@ def visualize_audio_scene_gs(
     candidates,
     gs_ply: Optional[str] = None,
     output_path: str = "data/output/gs_scene_viewer.html",
+    max_embedded_points: int = 150_000,
 ) -> str:
     """Create an interactive HTML viewer for the 3DGS scene with audio playback.
 
@@ -505,13 +506,24 @@ def visualize_audio_scene_gs(
     overlays coloured spheres for each enabled audio source, and adds per-source
     HTML5 ``<audio>`` controls below the 3D canvas.
 
+    A trained splat often contains millions of Gaussians; this viewer **subsamples**
+    vertices for a self-contained HTML file. SuperSplat and similar tools stream
+    the full representation, so they look much denser. Increase
+    ``max_embedded_points`` if your machine and browser tolerate a larger file.
+
+    The camera **frames the embedded point cloud** (centroid + bounding radius),
+    not the origin, so sources and splats stay in view together.
+
     Args:
         candidates:   List of ``AudioPlacementCandidate`` from
                       ``src.audio_placement.build_candidates``.
         gs_ply:       Path to the Gaussian PLY (combined composite or raw GS).
-                      When present the first 50 000 points are embedded as
+                      When present up to ``max_embedded_points`` are embedded as
                       inline JSON to avoid a separate file-serve step.
         output_path:  Destination path for the HTML file.
+        max_embedded_points: Cap on vertices embedded (default 150k). Subsampling
+                      uses evenly spaced indices along the PLY vertex order for
+                      better spatial coverage than uniform random sampling.
 
     Returns:
         Path to the written HTML file.
@@ -522,20 +534,42 @@ def visualize_audio_scene_gs(
     # ── Sample point cloud from PLY for inline embedding ──────────────────────
     cloud_points_json = "[]"
     cloud_colors_json = "[]"
+    n_total_pts = 0
+    # Camera framing from cloud bbox (world / PLY frame, same as audio positions)
+    cloud_center_json = json.dumps([0.0, 0.0, 0.0])
+    cloud_radius = 5.0
+    point_size_js = 0.012
+    n_embedded_pts = 0
     if gs_ply and os.path.exists(gs_ply):
         try:
             import open3d as o3d
             pcd = o3d.io.read_point_cloud(gs_ply)
             pts = np.asarray(pcd.points)
             cols = np.asarray(pcd.colors) if pcd.has_colors() else np.ones_like(pts) * 0.5
-            MAX_PTS = 50_000
-            if len(pts) > MAX_PTS:
-                idx = np.random.choice(len(pts), MAX_PTS, replace=False)
+            n_total_pts = len(pts)
+            cap = max(1000, int(max_embedded_points))
+            if len(pts) > cap:
+                # Even stride through vertices — better coverage than i.i.d. random
+                # when PLY groups Gaussians spatially or by training order.
+                idx = np.linspace(0, len(pts) - 1, num=cap, dtype=np.int64)
+                idx = np.unique(idx)
                 pts = pts[idx]
                 cols = cols[idx]
+            cmin = pts.min(axis=0)
+            cmax = pts.max(axis=0)
+            center = (0.5 * (cmin + cmax)).astype(np.float64)
+            extent = float(np.linalg.norm(cmax - cmin)) + 1e-6
+            cloud_radius = max(0.5, 0.55 * extent)
+            # Point sprite size in world units (Three.js PointsMaterial)
+            point_size_js = float(np.clip(0.004 + 0.0012 * extent, 0.006, 0.06))
+            cloud_center_json = json.dumps(center.tolist())
             cloud_points_json = json.dumps(pts.tolist())
             cloud_colors_json = json.dumps(cols.tolist())
-            logger.info(f"Embedded {len(pts):,} cloud points from {gs_ply}")
+            n_embedded_pts = len(pts)
+            logger.info(
+                f"Embedded {len(pts):,} / {n_total_pts:,} cloud points from {gs_ply} "
+                f"(cap={cap}); scene radius≈{cloud_radius:.3f}, point_size≈{point_size_js:.4f}"
+            )
         except Exception as exc:
             logger.warning(f"Could not sample PLY for viewer: {exc}")
 
@@ -553,6 +587,16 @@ def visualize_audio_scene_gs(
             f"intensity:{intensity:.4f}}}"
         )
     sources_js = "[" + ",\n".join(src_js_list) + "]"
+
+    camera_near_js = max(0.001, float(cloud_radius) * 5e-4)
+    camera_far_js = max(500.0, float(cloud_radius) * 120.0)
+    audio_sphere_r_js = float(np.clip(0.025 + 0.05 * cloud_radius, 0.04, 0.22))
+
+    stat_suffix = (
+        f"embedded {n_embedded_pts:,} / {n_total_pts:,} PLY vertices (subsample cap)"
+        if n_total_pts
+        else "no PLY loaded — spheres only"
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -580,7 +624,7 @@ def visualize_audio_scene_gs(
 <body>
 <div id="header">
   <h2>3DGS Audio Scene Viewer</h2>
-  <span id="stat">{len(enabled_sources)} audio source(s) &nbsp;|&nbsp; Drag to rotate &nbsp;|&nbsp; Scroll to zoom</span>
+  <span id="stat">{len(enabled_sources)} audio source(s) &nbsp;|&nbsp; {stat_suffix} &nbsp;|&nbsp; Drag to rotate &nbsp;|&nbsp; Scroll to zoom</span>
 </div>
 <div id="main">
   <div id="viewport">
@@ -598,6 +642,11 @@ def visualize_audio_scene_gs(
 const CLOUD_PTS   = {cloud_points_json};
 const CLOUD_COLS  = {cloud_colors_json};
 const AUDIO_SRCS  = {sources_js};
+const CLOUD_CENTER = {cloud_center_json};
+const CLOUD_RADIUS = {float(cloud_radius)};
+const POINT_SPRITE = {float(point_size_js)};
+const AUDIO_MARKER_R = {float(audio_sphere_r_js)};
+const cx = CLOUD_CENTER[0], cy = CLOUD_CENTER[1], cz = CLOUD_CENTER[2];
 
 // ── Three.js Setup ────────────────────────────────────────────────────────
 const canvas   = document.getElementById('c');
@@ -605,13 +654,12 @@ const renderer = new THREE.WebGLRenderer({{canvas, antialias: true, alpha: true}
 renderer.setClearColor(0x1a1a2e, 1);
 
 const scene  = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
-camera.position.set(0, 0, 5);
+const camera = new THREE.PerspectiveCamera(60, 1, {float(camera_near_js)}, {float(camera_far_js)});
 
 const ambient = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambient);
 const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-dirLight.position.set(5, 10, 5);
+dirLight.position.set(cx + 5, cy + 10, cz + 5);
 scene.add(dirLight);
 
 // ── Point cloud ───────────────────────────────────────────────────────────
@@ -625,7 +673,7 @@ if (CLOUD_PTS.length > 0) {{
   }}
   geo.setAttribute('position', new THREE.Float32BufferAttribute(flat, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(flatC, 3));
-  const mat = new THREE.PointsMaterial({{size: 0.012, vertexColors: true, sizeAttenuation: true}});
+  const mat = new THREE.PointsMaterial({{size: POINT_SPRITE, vertexColors: true, sizeAttenuation: true}});
   scene.add(new THREE.Points(geo, mat));
 }}
 
@@ -633,7 +681,7 @@ if (CLOUD_PTS.length > 0) {{
 const spheres = [];
 AUDIO_SRCS.forEach((src, idx) => {{
   const i = src.intensity;
-  const geo  = new THREE.SphereGeometry(0.08, 24, 24);
+  const geo  = new THREE.SphereGeometry(AUDIO_MARKER_R, 24, 24);
   const mat  = new THREE.MeshPhongMaterial({{color: new THREE.Color(i, 0.2, 1-i), emissive: new THREE.Color(i*0.3, 0, (1-i)*0.3)}});
   const mesh = new THREE.Mesh(geo, mat);
   mesh.position.set(src.position[0], src.position[1], src.position[2]);
@@ -642,8 +690,11 @@ AUDIO_SRCS.forEach((src, idx) => {{
   spheres.push(mesh);
 }});
 
-// ── Axes helper ───────────────────────────────────────────────────────────
-scene.add(new THREE.AxesHelper(0.5));
+// ── Axes helper at scene centroid ───────────────────────────────────────────
+const axLen = Math.max(0.15, CLOUD_RADIUS * 0.15);
+const axes = new THREE.AxesHelper(axLen);
+axes.position.set(cx, cy, cz);
+scene.add(axes);
 
 // ── Resize ────────────────────────────────────────────────────────────────
 function resize() {{
@@ -656,16 +707,19 @@ function resize() {{
 window.addEventListener('resize', resize);
 resize();
 
-// ── Orbit controls (minimal) ──────────────────────────────────────────────
+// ── Orbit controls (minimal) — pivot at cloud centroid, not world origin ───
 let isDrag = false, lastX = 0, lastY = 0;
-let theta = 0, phi = Math.PI / 3, radius = 5;
+let theta = 0, phi = Math.PI / 3;
+let radius = CLOUD_RADIUS;
+const rMin = Math.max(0.08, CLOUD_RADIUS * 0.12);
+const rMax = Math.max(CLOUD_RADIUS * 25.0, 80.0);
 function updateCamera() {{
   camera.position.set(
-    radius * Math.sin(phi) * Math.sin(theta),
-    radius * Math.cos(phi),
-    radius * Math.sin(phi) * Math.cos(theta)
+    cx + radius * Math.sin(phi) * Math.sin(theta),
+    cy + radius * Math.cos(phi),
+    cz + radius * Math.sin(phi) * Math.cos(theta)
   );
-  camera.lookAt(0, 0, 0);
+  camera.lookAt(cx, cy, cz);
 }}
 canvas.addEventListener('mousedown', e => {{ isDrag = true; lastX = e.clientX; lastY = e.clientY; }});
 canvas.addEventListener('mouseup',   () => isDrag = false);
@@ -678,7 +732,8 @@ canvas.addEventListener('mousemove', e => {{
   updateCamera();
 }});
 canvas.addEventListener('wheel', e => {{
-  radius = Math.max(0.5, Math.min(50, radius + e.deltaY * 0.01));
+  const step = 0.012 * CLOUD_RADIUS;
+  radius = Math.max(rMin, Math.min(rMax, radius + e.deltaY * 0.01 * step));
   updateCamera();
 }});
 updateCamera();
